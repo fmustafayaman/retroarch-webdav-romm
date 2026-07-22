@@ -276,14 +276,22 @@ it internally.
   *which rom*) — two different cores producing a same-named save file for
   two different ROMs will collide in RomM's per-user save list. Fine for a
   single-user/family library where filenames are already unique.
-- **On the very first sync for a rom, the manifest may briefly show a save
-  from before the shim's own naming/subfolder convention took over** — it
-  always serves back whichever entry is most recently updated, which
-  before any shim upload exists could be an old entry uploaded without the
-  emulator/subfolder info (e.g. from RomM's own native sync, or from
-  before this fix). Once RetroArch itself does one real upload for that
-  rom, everything self-corrects — its own uploads are always the newest,
-  so future syncs consistently show the exact right path.
+- **On the very first sync for a rom, before the shim has ever uploaded
+  anything for it, the manifest serves a flat path with no subfolder** —
+  content always comes from whichever entry is most recently updated
+  (including pre-existing foreign ones), but the subfolder is only ever
+  taken from an entry the shim itself created. Verified live that this
+  distinction is load-bearing, not defensive: a pre-existing entry's
+  `emulator` field can be differently cased than what RetroArch itself
+  sends (`"snes9x"` vs. RetroArch's own `"Snes9x"`), and reconstructing
+  the path from that untrusted value put a downloaded save in a folder
+  RetroArch never looks in — it wasn't just a wrong guess, the save
+  became invisible to RetroArch. A flat fallback path isn't necessarily
+  "correct" either (RetroArch might expect a subfolder it just doesn't
+  have reliable info for yet), but it's a safe, predictable one. Once
+  RetroArch does one real upload for that rom, its own upload is always
+  the newest trusted source, so every sync after that reconstructs the
+  exact right subfolder from then on.
 - **`content_hash` fallback.** RomM's save/state rows may have a null
   `content_hash` (e.g. rows that predate hashing support). The shim falls
   back to a `size-updated_at` fingerprint for the manifest in that case,

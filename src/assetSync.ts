@@ -100,9 +100,16 @@ export function pickLatest(assets: RommAsset[]): RommAsset {
 }
 
 /**
- * Finds every asset the shim itself created for a filename — never a
- * foreign/pre-existing entry. Only used by `deleteAssetContent` below, to
- * make sure a delete can never remove history it didn't create.
+ * Whether the shim itself created `asset` — never true for a
+ * foreign/pre-existing entry. Used by `deleteAssetContent` below (so a
+ * delete can never remove history it didn't create) and by
+ * `manifest.ts` (so a save/state's per-core subfolder is only ever
+ * reconstructed from a source we know came from a real RetroArch upload —
+ * see the note on `ResolvedAssetPath.emulator` above. RomM's own `emulator`
+ * field on foreign entries has been observed lowercased ("snes9x") where
+ * RetroArch itself sends it capitalized ("Snes9x") verified live: trusting
+ * a foreign entry's casing for the manifest path put a save in a `snes9x`
+ * folder RetroArch never looks in, silently discarding it — so don't).
  *
  * Saves: tagged with a fixed, non-null `slot` (`config.rommSaveSlot`) on
  * creation — matched on that plus rom_id.
@@ -111,25 +118,26 @@ export function pickLatest(assets: RommAsset[]): RommAsset {
  * `withUniqueSuffix` naming pattern (`<base>-<timestamp>Z<ext>`) instead —
  * old, differently-named archival entries never match that pattern.
  */
+export function isShimOwned(kind: AssetKind, asset: RommAsset, base: string): boolean {
+  if (kind === "saves") return asset.slot === config.rommSaveSlot;
+  const pattern = ownUploadPattern(base, `.${asset.file_extension}`);
+  return pattern.test(asset.file_name);
+}
+
 async function findManagedAssets(kind: AssetKind, fileName: string): Promise<RommAsset[]> {
   const rom = await resolveRomForFileName(fileName);
   if (!rom) return [];
 
+  const base = path.posix.basename(fileName, path.posix.extname(fileName));
   const assets = await listAssets(kind);
-  if (kind === "saves") {
-    return assets.filter((a) => a.rom_id === rom.id && a.slot === config.rommSaveSlot);
-  }
-  const pattern = ownUploadPattern(fileName);
-  return assets.filter((a) => a.rom_id === rom.id && pattern.test(a.file_name));
+  return assets.filter((a) => a.rom_id === rom.id && isShimOwned(kind, a, base));
 }
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function ownUploadPattern(fileName: string): RegExp {
-  const ext = path.posix.extname(fileName);
-  const base = path.posix.basename(fileName, ext);
+function ownUploadPattern(base: string, ext: string): RegExp {
   return new RegExp(`^${escapeRegExp(base)}-\\d{8}T\\d{6}Z${escapeRegExp(ext)}$`);
 }
 
