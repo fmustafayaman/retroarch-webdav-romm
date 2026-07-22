@@ -1,0 +1,26 @@
+# Deploy alongside an existing RomM instance on Dokploy/Coolify.
+# Both platforms build straight from this file — point the app at this repo
+# and set the env vars below in the platform's UI (or via a mounted .env).
+services:
+  retroarch-webdav-romm:
+    build: .
+    restart: unless-stopped
+    environment:
+      ROMM_BASE_URL: ${ROMM_BASE_URL}
+      ROMM_USERNAME: ${ROMM_USERNAME}
+      ROMM_PASSWORD: ${ROMM_PASSWORD}
+      WEBDAV_USERNAME: ${WEBDAV_USERNAME}
+      WEBDAV_PASSWORD: ${WEBDAV_PASSWORD}
+      PORT: 8080
+      BIND_ADDRESS: 0.0.0.0
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    # If RomM runs as another Compose service on this same host/stack, drop
+    # the ports mapping above (let the platform's reverse proxy handle TLS
+    # termination and routing instead) and join RomM's network here, e.g.:
+    # networks:
+    #   - romm_default
+    # networks:
+    #   romm_default:
+    #     external: true
