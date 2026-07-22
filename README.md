@@ -107,22 +107,38 @@ RetroArch itself has no way to browse or pull content from an arbitrary
 custom server — its "Online Updater" / buildbot settings are for cores and
 UI assets (thumbnails, overlays, shaders, database files), not games, and
 there's no general "connect to a content server" feature. So getting roms
-from RomM onto a device (especially iOS, which has no direct filesystem
-access from other apps) goes through the platform's own generic WebDAV
-client instead:
+onto a device is always a manual step of some kind — there's no automatic
+"RetroArch downloads what it's missing" flow to build on given RetroArch's
+actual capabilities.
 
-1. On iOS: **Files app → Browse → ⋯ → Connect to Server**, enter
-   `https://<your-shim-host>/`, and sign in with `WEBDAV_USERNAME`/`WEBDAV_PASSWORD`
-   (same credentials as Cloud Sync above).
-2. Browse into `roms/<platform>/`, find the game, tap to download (iOS
-   downloads it into Files' local storage / iCloud Drive, your choice).
-3. Move/copy the file into **On My iPhone/iPad → RetroArch** so RetroArch's
-   own content browser picks it up.
+**On iOS, the simplest path is RomM's own web UI, not this shim.** RomM is
+a full web app — open `https://<your-romm-host>/` in Safari, log in with
+your RomM account, browse, and download. Safari's download manager handles
+large files (background downloads, resumable) without needing any extra
+app. Verified: **iOS's built-in Files app does not reliably support
+"Connect to Server" for arbitrary WebDAV servers** — it failed for a real
+deployment of the `/roms/` tree below even though the server side checked
+out correctly on every count (curl confirmed proper `207` PROPFIND
+responses, correct `text/xml` content type, working fake LOCK/UNLOCK
+handshake, and Cloudflare passing PROPFIND through untouched). Multiple
+unrelated projects' iOS users report the same "This URL is not supported"
+failure against their own WebDAV servers — it's an iOS Files limitation,
+not something fixable from the server side. A third-party WebDAV client
+app (e.g. "WebDAV Manager", or FileBrowser's Files-app integration) is the
+documented workaround if you want to use `/roms/` from iOS instead.
 
-This is manual (tap through Files each time), not an automatic "RetroArch
-downloads what it's missing" flow — there isn't one to build on given
-RetroArch's actual capabilities. See `src/romBrowser.ts` and the PROPFIND
-handling in `src/webdavServer.ts`.
+The `/roms/` tree (below) is still there and works — it's just a better
+fit for platforms with solid native WebDAV support (Windows, macOS,
+Android) than for iOS specifically:
+
+1. Connect to `https://<your-shim-host>/` with a WebDAV client, using
+   `WEBDAV_USERNAME`/`WEBDAV_PASSWORD` (same credentials as Cloud Sync
+   above).
+2. Browse into `roms/<platform>/`, find the game, download it.
+3. Move/copy the file into RetroArch's content directory so its own
+   content browser picks it up.
+
+See `src/romBrowser.ts` and the PROPFIND handling in `src/webdavServer.ts`.
 
 A few things verified against a live instance that shaped how `/roms/` is
 built:
