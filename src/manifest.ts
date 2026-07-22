@@ -77,7 +77,13 @@ async function buildEntries(
     assets.map(async (a) => {
       const base = await romName(a.rom_id);
       if (!base) return null;
-      return toEntry(`${prefix}/${base}.${a.file_extension}`, a);
+      // Reconstructs RetroArch's own per-core subfolder (e.g.
+      // "saves/Snes9x/Game.srm") when the winning asset has one — see
+      // `emulator` on ResolvedAssetPath in assetSync.ts for why this has
+      // to match exactly, or RetroArch treats it as a different file and
+      // re-uploads on every sync.
+      const dir = a.emulator ? `${prefix}/${a.emulator}` : prefix;
+      return toEntry(`${dir}/${base}.${a.file_extension}`, a);
     }),
   );
   return entries.filter((e): e is { path: string; hash: string } => e !== null);

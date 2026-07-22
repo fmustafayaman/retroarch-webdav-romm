@@ -10,6 +10,7 @@ export interface RommAsset {
   updated_at: string;
   content_hash: string | null;
   slot?: string | null;
+  emulator: string | null;
 }
 
 export interface RommRomMatch {
@@ -198,6 +199,7 @@ async function uploadNewAsset(
   romId: number,
   fileName: string,
   content: Buffer,
+  emulator: string | null,
 ): Promise<RommAsset> {
   const form = new FormData();
   const field = kind === "saves" ? "saveFile" : "stateFile";
@@ -209,32 +211,29 @@ async function uploadNewAsset(
   // ever-growing archival history (RomM never dedupes null-slot saves).
   // States have no slot concept in the API.
   if (kind === "saves") qs.set("slot", config.rommSaveSlot);
+  // Records which core (RetroArch's own per-core subfolder name, e.g.
+  // "Snes9x") this save/state came from, so the manifest can reconstruct
+  // the exact same subfolder path RetroArch itself uses locally — see
+  // manifest.ts. Without this, the manifest's path and RetroArch's local
+  // path never match, and RetroArch re-uploads the "missing" file on
+  // every single sync.
+  if (emulator) qs.set("emulator", emulator);
   const res = await rommFetchOk(`/api/${kind}?${qs}`, { method: "POST", body: form });
   return (await res.json()) as RommAsset;
 }
 
-async function updateExistingAsset(
-  kind: "saves" | "states",
-  id: number,
+export const uploadNewSave = (
+  romId: number,
   fileName: string,
   content: Buffer,
-): Promise<RommAsset> {
-  const form = new FormData();
-  const field = kind === "saves" ? "saveFile" : "stateFile";
-  form.append(field, new Blob([content]), fileName);
-
-  const res = await rommFetchOk(`/api/${kind}/${id}`, { method: "PUT", body: form });
-  return (await res.json()) as RommAsset;
-}
-
-export const uploadNewSave = (romId: number, fileName: string, content: Buffer) =>
-  uploadNewAsset("saves", romId, fileName, content);
-export const uploadNewState = (romId: number, fileName: string, content: Buffer) =>
-  uploadNewAsset("states", romId, fileName, content);
-export const updateSave = (id: number, fileName: string, content: Buffer) =>
-  updateExistingAsset("saves", id, fileName, content);
-export const updateState = (id: number, fileName: string, content: Buffer) =>
-  updateExistingAsset("states", id, fileName, content);
+  emulator: string | null,
+) => uploadNewAsset("saves", romId, fileName, content, emulator);
+export const uploadNewState = (
+  romId: number,
+  fileName: string,
+  content: Buffer,
+  emulator: string | null,
+) => uploadNewAsset("states", romId, fileName, content, emulator);
 
 async function deleteAssets(kind: "saves" | "states", ids: number[]): Promise<void> {
   const body = kind === "saves" ? { saves: ids } : { states: ids };

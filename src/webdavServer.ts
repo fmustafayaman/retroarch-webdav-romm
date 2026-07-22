@@ -300,7 +300,7 @@ async function handlePut(reqPath: string, req: IncomingMessage, res: ServerRespo
   }
 
   try {
-    await putAssetContent(resolved.kind, resolved.fileName, body);
+    await putAssetContent(resolved.kind, resolved.fileName, body, resolved.emulator);
     res.writeHead(201).end();
   } catch (err) {
     logger.error({ err, path: reqPath }, "failed to upload asset to romm");

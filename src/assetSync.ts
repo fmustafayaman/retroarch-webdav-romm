@@ -21,25 +21,28 @@ export interface ResolvedAssetPath {
   kind: AssetKind;
   /** Filename only (last path segment) — RetroArch save filenames mirror the rom filename. */
   fileName: string;
+  /**
+   * The per-core subfolder RetroArch nests saves/states under (e.g.
+   * "saves/Snes9x/Chrono Trigger.srm" → "Snes9x"), if any. Verified
+   * against a live instance that this is RetroArch's actual, consistently
+   * used local directory structure for both saves and states — not an
+   * edge case. It has to round-trip into RomM's `emulator` field and back
+   * out into the manifest path (see manifest.ts): the manifest's path is
+   * the key RetroArch diffs its local files against, and a mismatched key
+   * means RetroArch can never recognize a match, so it re-uploads the
+   * "missing" file on every single sync.
+   */
+  emulator: string | null;
 }
 
-/**
- * Maps a WebDAV request path to a RomM asset kind + filename.
- *
- * RetroArch may nest saves/states under a per-core subdirectory
- * (e.g. "saves/snes9x/Chrono Trigger.srm") if the user has "sort saves by
- * core" enabled locally. RomM has no notion of that subdirectory, so we
- * match purely on the basename. TODO: if two different cores produce a
- * save with the identical filename for different roms, they'll collide in
- * RomM's per-user save list — acceptable for a single-user setup, but a
- * real fix would need RomM to track the core/subfolder too.
- */
+/** Maps a WebDAV request path to a RomM asset kind + filename + per-core subfolder. */
 export function resolveAssetPath(webdavPath: string): ResolvedAssetPath | null {
   const clean = webdavPath.replace(/^\/+/, "");
   const [top, ...rest] = clean.split("/");
   if (rest.length === 0) return null;
   if (top !== "saves" && top !== "states") return null;
-  return { kind: top, fileName: path.posix.basename(clean) };
+  const emulator = rest.length > 1 ? rest.slice(0, -1).join("/") : null;
+  return { kind: top, fileName: path.posix.basename(clean), emulator };
 }
 
 async function listAssets(kind: AssetKind): Promise<RommAsset[]> {
@@ -161,6 +164,7 @@ export async function putAssetContent(
   kind: AssetKind,
   fileName: string,
   content: Buffer,
+  emulator: string | null,
 ): Promise<void> {
   const rom = await resolveRomForFileName(fileName);
   if (!rom) {
@@ -169,9 +173,12 @@ export async function putAssetContent(
   }
 
   const uniqueFileName = withUniqueSuffix(fileName);
-  logger.debug({ kind, fileName, uniqueFileName, romId: rom.id }, "uploading new romm asset");
-  if (kind === "saves") await uploadNewSave(rom.id, uniqueFileName, content);
-  else await uploadNewState(rom.id, uniqueFileName, content);
+  logger.debug(
+    { kind, fileName, uniqueFileName, romId: rom.id, emulator },
+    "uploading new romm asset",
+  );
+  if (kind === "saves") await uploadNewSave(rom.id, uniqueFileName, content, emulator);
+  else await uploadNewState(rom.id, uniqueFileName, content, emulator);
 }
 
 function withUniqueSuffix(fileName: string): string {

@@ -40,9 +40,19 @@ RetroArch's Cloud Sync, which never touches `/roms/` at all.
 - `GET|PUT /saves/<filename>`, `GET|PUT /states/<filename>` — proxied to
   RomM's `/api/saves` / `/api/states` endpoints. The target ROM is matched
   by filename (RetroArch save filenames mirror the ROM filename), per
-  `src/assetSync.ts`. Any subdirectory in the WebDAV path (e.g. if
-  RetroArch is configured to sort saves per-core) is ignored — only the
-  basename is used to match.
+  `src/assetSync.ts`.
+  - **RetroArch consistently nests saves/states under a per-core
+    subfolder** (verified live: `saves/Snes9x/Chrono Trigger (USA).srm`,
+    same for states) — this is RetroArch's real local directory layout,
+    not an edge case. The subfolder is captured on upload and stored on
+    RomM's `emulator` field, then used to reconstruct the *exact same*
+    subfolder path when building `manifest.server`. This round-trip
+    matters more than it looks: RetroArch's sync diffs against the
+    manifest by exact path string, so a manifest path missing the
+    subfolder RetroArch actually uses locally is treated as a completely
+    different, unrelated file — RetroArch would never recognize a match
+    and would re-upload the "missing" file (as a brand-new history entry,
+    given the point below) on every single sync, forever.
   - **Every upload creates a new history entry — nothing is ever
     overwritten in place.** `GET` always serves back whichever entry for
     that rom/slot was updated most recently; a `PUT` never touches an
@@ -260,12 +270,20 @@ it internally.
   play this can accumulate a lot of rows per rom. RomM's own UI/API
   (`autocleanup`/`autocleanup_limit` on saves, or manual deletion) is the
   place to prune, not something this shim does on your behalf.
-- **Filename-only ROM matching.** If RetroArch is configured to sort saves
-  into per-core subdirectories, two different cores producing a
-  same-named save file for two different ROMs will collide in RomM's
-  per-user save list (only the basename is used for matching). Fine for a
-  single-user/family library where filenames are already unique; would need
-  RomM to expose core/subfolder metadata to fix properly.
+- **Filename-only ROM matching.** The rom to sync against is still resolved
+  from the filename alone (the core subfolder round-trips into RomM's
+  `emulator` field for path reconstruction, but isn't used to disambiguate
+  *which rom*) — two different cores producing a same-named save file for
+  two different ROMs will collide in RomM's per-user save list. Fine for a
+  single-user/family library where filenames are already unique.
+- **On the very first sync for a rom, the manifest may briefly show a save
+  from before the shim's own naming/subfolder convention took over** — it
+  always serves back whichever entry is most recently updated, which
+  before any shim upload exists could be an old entry uploaded without the
+  emulator/subfolder info (e.g. from RomM's own native sync, or from
+  before this fix). Once RetroArch itself does one real upload for that
+  rom, everything self-corrects — its own uploads are always the newest,
+  so future syncs consistently show the exact right path.
 - **`content_hash` fallback.** RomM's save/state rows may have a null
   `content_hash` (e.g. rows that predate hashing support). The shim falls
   back to a `size-updated_at` fingerprint for the manifest in that case,
