@@ -1,4 +1,5 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import crypto from "node:crypto";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { config } from "./config.js";
@@ -17,7 +18,7 @@ import { buildMultistatus, type PropfindEntry } from "./webdavXml.js";
 
 const MANIFEST_PATH = "manifest.server";
 
-const ALLOWED_METHODS = "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE";
+const ALLOWED_METHODS = "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE, LOCK, UNLOCK";
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -49,10 +50,43 @@ function requestPath(req: IncomingMessage): string {
 async function handleOptions(res: ServerResponse) {
   res.writeHead(200, {
     Allow: ALLOWED_METHODS,
-    DAV: "1",
+    // Class 2 (locking) is advertised alongside the fake LOCK/UNLOCK below —
+    // some WebDAV clients (iOS Files among them, by report) refuse to treat
+    // a server as mountable at all without it, even for read-only browsing.
+    DAV: "1, 2",
     "Content-Length": "0",
   });
   res.end();
+}
+
+/**
+ * Fake, always-succeeds locking. Nothing here is actually lockable — the
+ * shim has no concept of concurrent writers to guard against — but some
+ * WebDAV clients (iOS Files among them, by report) won't complete
+ * "Connect to Server" without a server that at least answers LOCK/UNLOCK,
+ * so this exists purely for that compatibility handshake.
+ */
+async function handleLock(res: ServerResponse) {
+  const token = `opaquelocktoken:${crypto.randomUUID()}`;
+  const body =
+    `<?xml version="1.0" encoding="utf-8"?>` +
+    `<D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>` +
+    `<D:locktype><D:write/></D:locktype>` +
+    `<D:lockscope><D:exclusive/></D:lockscope>` +
+    `<D:depth>0</D:depth>` +
+    `<D:timeout>Second-3600</D:timeout>` +
+    `<D:locktoken><D:href>${token}</D:href></D:locktoken>` +
+    `</D:activelock></D:lockdiscovery></D:prop>`;
+  res.writeHead(200, {
+    "Content-Type": "text/xml; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "Lock-Token": `<${token}>`,
+  });
+  res.end(body);
+}
+
+async function handleUnlock(res: ServerResponse) {
+  res.writeHead(204).end();
 }
 
 /**
@@ -89,7 +123,11 @@ async function handlePropfind(reqPath: string, req: IncomingMessage, res: Server
 
   const body = buildMultistatus(entries);
   res.writeHead(207, {
-    "Content-Type": "application/xml; charset=utf-8",
+    // iOS Files' WebDAV client is known to be picky about this — "text/xml"
+    // (the traditional WebDAV content type) is the safer bet over
+    // "application/xml", which some Apple WebDAV client versions have
+    // reportedly failed to parse.
+    "Content-Type": "text/xml; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
   });
   res.end(body);
@@ -347,6 +385,10 @@ export function createServer() {
           return await handleMkcol(res);
         case "MOVE":
           return await handleMove(reqPath, req, res);
+        case "LOCK":
+          return await handleLock(res);
+        case "UNLOCK":
+          return await handleUnlock(res);
         default:
           res.writeHead(501).end();
       }
