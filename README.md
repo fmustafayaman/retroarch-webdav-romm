@@ -53,6 +53,26 @@ RetroArch's Cloud Sync, which never touches `/roms/` at all.
     different, unrelated file — RetroArch would never recognize a match
     and would re-upload the "missing" file (as a brand-new history entry,
     given the point below) on every single sync, forever.
+  - **RomM's `emulator` field and RetroArch's local directory name are
+    two different strings for the same core**, not the same string in two
+    casings — e.g. RomM's convention is `snes9x`, RetroArch's own local
+    folder is `Snes9x`; for some cores they diverge further (RomM `mgba`
+    → RetroArch `mGBA`, RomM `mupen64plus_next` → RetroArch
+    `Mupen64Plus-Next`). Verified live that this is a real, not
+    theoretical, problem: naively round-tripping whatever string is
+    stored put a downloaded save in a `snes9x` folder RetroArch never
+    looks in — the save wasn't just misplaced, it was invisible to
+    RetroArch. Fixed with a translation table
+    (`src/emulatorNames.ts`, `toRommEmulator`/`toRetroArchDirName`) ported
+    from the community
+    [romm-retroarch-sync](https://github.com/Covin90/romm-retroarch-sync)
+    desktop app, which had already solved this exact problem — the
+    captured RetroArch folder name is normalized to RomM's convention
+    before upload, and translated back through the same table (with a
+    best-effort fallback for unmapped cores) when reconstructing the
+    manifest path. This works for *any* entry with the field set, not just
+    ones this shim uploaded, so it's correct from the very first sync —
+    no "wait for the shim's own upload to self-correct" caveat needed.
   - **Every upload creates a new history entry — nothing is ever
     overwritten in place.** `GET` always serves back whichever entry for
     that rom/slot was updated most recently; a `PUT` never touches an
@@ -82,10 +102,14 @@ RetroArch's Cloud Sync, which never touches `/roms/` at all.
     `[<timestamp>]` suffix to the stored filename regardless of what's
     sent, so a save could never be found again by name either way. The
     shim tags every save it creates with a fixed `slot`
-    (`ROMM_SAVE_SLOT`, default `webdav-shim`) and matches deletes on
-    `(rom_id, slot)` instead. States have no slot field, so a shim-owned
-    state for `DELETE` purposes is instead recognized by the
-    `withUniqueSuffix` naming pattern itself.
+    (`ROMM_SAVE_SLOT`, default `autosave` — not arbitrary: it's the same
+    slot name RomM's own reference clients report a game's primary save
+    under, per romm-retroarch-sync, so saves from this shim pair with
+    rather than fragment away from anything else in the setup using that
+    convention) and matches deletes on `(rom_id, slot)` instead. States
+    have no slot field in this RomM version, so a shim-owned state for
+    `DELETE` purposes is instead recognized by the `withUniqueSuffix`
+    naming pattern itself.
   - **RomM's rom search (`search_term`) doesn't handle fully tagged
     filenames.** Searching for `"Silent Hill (Europe) (En,Fr,De,Es,It)"`
     verbatim returns zero results on a live instance, even though the rom
@@ -217,8 +241,9 @@ See `.env.example`. All required, no hardcoded secrets in code:
   `ROMM_USERNAME`/`ROMM_PASSWORD` — the RomM account whose saves/states/roms
   are exposed.
 - `ROMM_SAVE_SLOT` — fixed slot tag the shim uses for saves it creates
-  (default `webdav-shim`). Only change this if running more than one
-  instance of this shim against the same RomM account.
+  (default `autosave`, matching RomM's own reference clients — see above).
+  Only change this if running more than one instance of this shim against
+  the same RomM account.
 - `WEBDAV_USERNAME`, `WEBDAV_PASSWORD` — credentials RetroArch authenticates
   with against this shim.
 - `PORT`, `BIND_ADDRESS` — shim's own listen socket (defaults `8080` /
@@ -276,22 +301,14 @@ it internally.
   *which rom*) — two different cores producing a same-named save file for
   two different ROMs will collide in RomM's per-user save list. Fine for a
   single-user/family library where filenames are already unique.
-- **On the very first sync for a rom, before the shim has ever uploaded
-  anything for it, the manifest serves a flat path with no subfolder** —
-  content always comes from whichever entry is most recently updated
-  (including pre-existing foreign ones), but the subfolder is only ever
-  taken from an entry the shim itself created. Verified live that this
-  distinction is load-bearing, not defensive: a pre-existing entry's
-  `emulator` field can be differently cased than what RetroArch itself
-  sends (`"snes9x"` vs. RetroArch's own `"Snes9x"`), and reconstructing
-  the path from that untrusted value put a downloaded save in a folder
-  RetroArch never looks in — it wasn't just a wrong guess, the save
-  became invisible to RetroArch. A flat fallback path isn't necessarily
-  "correct" either (RetroArch might expect a subfolder it just doesn't
-  have reliable info for yet), but it's a safe, predictable one. Once
-  RetroArch does one real upload for that rom, its own upload is always
-  the newest trusted source, so every sync after that reconstructs the
-  exact right subfolder from then on.
+- **The `emulator`→directory-name table (`src/emulatorNames.ts`) is a
+  fixed list of known libretro cores**, ported from romm-retroarch-sync.
+  An entry with `emulator` set to something not in the table falls back
+  to a best-effort transform (title-case, `beetle_`/`mednafen_` →
+  `"Beetle "`, underscores → spaces) rather than a guaranteed-correct
+  name — fine for common cores, may need a table entry added for an
+  obscure one. An entry with no `emulator` at all still falls back to a
+  flat path with no subfolder, same as before.
 - **`content_hash` fallback.** RomM's save/state rows may have a null
   `content_hash` (e.g. rows that predate hashing support). The shim falls
   back to a `size-updated_at` fingerprint for the manifest in that case,

@@ -14,6 +14,7 @@ import {
 } from "./rommClient.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
+import { toRommEmulator } from "./emulatorNames.js";
 
 export type AssetKind = "saves" | "states";
 
@@ -180,13 +181,21 @@ export async function putAssetContent(
     throw new Error(`No RomM rom found matching filename base "${baseName}" for ${fileName}`);
   }
 
+  // Normalize RetroArch's own directory name ("Snes9x") to RomM's
+  // lowercase/underscore convention ("snes9x") before storing it — see
+  // emulatorNames.ts. Matching RomM's own convention (rather than storing
+  // RetroArch's raw casing) is what lets manifest.ts translate it back to
+  // the *correct* RetroArch folder name for ANY entry with this field
+  // set, not just ones this shim uploaded.
+  const rommEmulator = emulator ? toRommEmulator(emulator) : null;
+
   const uniqueFileName = withUniqueSuffix(fileName);
   logger.debug(
-    { kind, fileName, uniqueFileName, romId: rom.id, emulator },
+    { kind, fileName, uniqueFileName, romId: rom.id, emulator: rommEmulator },
     "uploading new romm asset",
   );
-  if (kind === "saves") await uploadNewSave(rom.id, uniqueFileName, content, emulator);
-  else await uploadNewState(rom.id, uniqueFileName, content, emulator);
+  if (kind === "saves") await uploadNewSave(rom.id, uniqueFileName, content, rommEmulator);
+  else await uploadNewState(rom.id, uniqueFileName, content, rommEmulator);
 }
 
 function withUniqueSuffix(fileName: string): string {

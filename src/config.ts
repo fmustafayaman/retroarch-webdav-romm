@@ -22,12 +22,15 @@ export const config = {
   rommAuth: rommAuth(),
 
   // Stable RomM save "slot" tag the shim uses for every save it creates.
-  // Saves are paired on (rom_id, slot) by RomM's own sync engine; a stable,
-  // non-null slot keeps our uploads as a single updatable row instead of
-  // piling up as untethered archival entries (RomM treats null-slot saves
-  // as archival/manual and never dedupes them). States have no slot
-  // concept in the RomM API, so this only applies to saves.
-  rommSaveSlot: process.env.ROMM_SAVE_SLOT ?? "webdav-shim",
+  // Saves are paired on (rom_id, slot) by RomM's own sync engine. Default
+  // is "autosave" — not an arbitrary choice: it's the same slot name
+  // RomM's own reference clients (grout, muos-app, the community
+  // romm-retroarch-sync desktop app) report a game's primary save under,
+  // so saves from this shim pair with — rather than fragment away from —
+  // whatever else in the user's setup also uses that convention. States
+  // have no slot concept in this RomM version, so this only applies to
+  // saves.
+  rommSaveSlot: process.env.ROMM_SAVE_SLOT ?? "autosave",
 
   webdavUsername: required("WEBDAV_USERNAME"),
   webdavPassword: required("WEBDAV_PASSWORD"),
