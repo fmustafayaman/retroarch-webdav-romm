@@ -43,20 +43,39 @@ RetroArch's Cloud Sync, which never touches `/roms/` at all.
   `src/assetSync.ts`. Any subdirectory in the WebDAV path (e.g. if
   RetroArch is configured to sort saves per-core) is ignored — only the
   basename is used to match.
-  - **Saves are matched by `(rom, slot)`, not by filename**, and this is
-    load-bearing, not incidental. Verified against a live RomM instance:
-    `POST /api/saves` silently appends a `[<timestamp>]` suffix to
-    whatever filename you send it, so the name a save comes back under is
-    never the name it was uploaded with — matching on filename would mean
-    every sync "discovers" a brand new file and re-uploads forever. The
-    shim tags every save it creates with a fixed `slot` (`ROMM_SAVE_SLOT`,
-    default `webdav-shim`) and matches on `(rom_id, slot)` instead, which
-    is also what RomM's own sync engine uses as the stable pairing key.
-    When building `manifest.server`, the original filename is
-    reconstructed from the owning rom's `fs_name_no_ext` + the save's own
-    (untouched) extension — not from the save's stored `file_name`.
-    States don't have this problem: RomM preserves state filenames
-    exactly, so those are matched and reported by filename directly.
+  - **Every upload creates a new history entry — nothing is ever
+    overwritten in place.** `GET` always serves back whichever entry for
+    that rom/slot was updated most recently; a `PUT` never touches an
+    existing row, it always adds a new one. This means a library's
+    pre-existing saves/states (from RomM's own native sync, a browser play
+    session, a manual upload — anything, not just this shim) show up in
+    RetroArch automatically on first sync with no manual step, since
+    "most recently updated" naturally includes them — and it means
+    nothing this shim does can ever destroy an older save/state, since old
+    rows are only ever read, never mutated or replaced. See
+    `findAssetForDownload` / `putAssetContent` in `src/assetSync.ts`.
+  - **Getting real create-a-new-row semantics out of RomM took an extra
+    step.** Verified against a live instance: `POST /api/saves` and
+    `/api/states` both dedupe on `(rom_id, filename)` specifically — a
+    second upload with the same filename silently replaces the first
+    regardless of `slot` or the `overwrite` query flag. Since RetroArch
+    always sends the same filename for a given save/state slot, every
+    upload would otherwise collide. The fix: the shim stamps a timestamp
+    into the filename it sends to RomM (`withUniqueSuffix` in
+    `src/assetSync.ts`) — RetroArch never sees this name, since
+    `manifest.server` always reconstructs the plain expected filename from
+    the rom + the asset's own extension, not from whatever RomM stored it
+    as.
+  - **Saves are still matched by `(rom, slot)` for anything write-shaped**
+    (find-the-shim's-own-row-to `DELETE`), not by filename — on top of the
+    dedup issue above, `POST /api/saves` separately appends its own
+    `[<timestamp>]` suffix to the stored filename regardless of what's
+    sent, so a save could never be found again by name either way. The
+    shim tags every save it creates with a fixed `slot`
+    (`ROMM_SAVE_SLOT`, default `webdav-shim`) and matches deletes on
+    `(rom_id, slot)` instead. States have no slot field, so a shim-owned
+    state for `DELETE` purposes is instead recognized by the
+    `withUniqueSuffix` naming pattern itself.
   - **RomM's rom search (`search_term`) doesn't handle fully tagged
     filenames.** Searching for `"Silent Hill (Europe) (En,Fr,De,Es,It)"`
     verbatim returns zero results on a live instance, even though the rom
@@ -227,25 +246,26 @@ it internally.
   with core version A and load it with core version B, RetroArch/the core
   may reject it. That's a RetroArch/libretro-core limitation, not something
   this shim can fix.
-- **Conflict handling is last-write-wins**, matching the brief — no real
-  three-way merge or divergence detection. If a save is modified from two
-  devices between syncs, whichever PUT lands last on RomM wins. A real fix
-  would mean tracking per-device revision history, which RomM doesn't
-  currently expose.
+- **No real conflict detection** — the newest `updated_at` always wins on
+  read, full stop. If a save is modified from two devices between syncs,
+  whichever one uploaded most recently is what every device sees next; the
+  other device's change isn't lost (its row is kept, per the history
+  behavior above) but it's also not surfaced as a conflict anywhere. A
+  real fix would mean actual divergence detection, which is out of scope
+  for v1 — see the brief's "don't try to be clever" guidance.
+- **History grows forever, there's no pruning.** Every save/state upload
+  is a new row (see above) and nothing here ever deletes old ones
+  automatically — `DELETE` only removes the single most recent
+  shim-created entry, on RetroArch's own request. Over months of regular
+  play this can accumulate a lot of rows per rom. RomM's own UI/API
+  (`autocleanup`/`autocleanup_limit` on saves, or manual deletion) is the
+  place to prune, not something this shim does on your behalf.
 - **Filename-only ROM matching.** If RetroArch is configured to sort saves
   into per-core subdirectories, two different cores producing a
   same-named save file for two different ROMs will collide in RomM's
   per-user save list (only the basename is used for matching). Fine for a
   single-user/family library where filenames are already unique; would need
   RomM to expose core/subfolder metadata to fix properly.
-- **Pre-existing saves not created by this shim won't appear in the
-  manifest on first run.** Only saves tagged with the shim's own `slot`
-  are included (see above) — saves from RomM's own native sync client, a
-  browser play session, or a manual upload are left alone rather than
-  guessed at (a rom can have many historical null-slot saves; there's no
-  safe way to pick "the" canonical one). The first `PUT` RetroArch sends
-  for a rom becomes the new shim-managed save going forward. States are
-  unaffected by this — they're matched by filename regardless of origin.
 - **`content_hash` fallback.** RomM's save/state rows may have a null
   `content_hash` (e.g. rows that predate hashing support). The shim falls
   back to a `size-updated_at` fingerprint for the manifest in that case,

@@ -1,5 +1,5 @@
-import { config } from "./config.js";
 import { getRomById, listSaves, listStates, type RommAsset } from "./rommClient.js";
+import { pickLatest } from "./assetSync.js";
 
 /**
  * RetroArch's cloud sync diffs against a JSON manifest of {path, hash}
@@ -9,19 +9,20 @@ import { getRomById, listSaves, listStates, type RommAsset } from "./rommClient.
  * truth, so the manifest can never drift from it. PUTs of manifest.server
  * (RetroArch writes one back after each sync) are accepted and discarded;
  * see webdavServer.ts.
+ *
+ * Every entry here is picked as "the most recently updated asset for this
+ * (rom, slot)" regardless of who created it — RomM's own native sync, a
+ * browser play session, a manual upload, or this shim. That's what lets a
+ * library's pre-existing progress show up in RetroArch automatically on
+ * first sync, with no manual per-game step: this is a read-only listing,
+ * so nothing about a pre-existing entry is ever touched here. Writes
+ * (assetSync.ts's putAssetContent) always create a fresh shim-managed row
+ * rather than overwriting whatever this surfaced, so old entries are only
+ * ever read, never mutated.
  */
 export async function buildServerManifest(): Promise<string> {
   const [saves, states] = await Promise.all([listSaves(), listStates()]);
 
-  // Verified against a live RomM instance: POST /api/saves silently
-  // appends a "[<timestamp>]" suffix to whatever filename is sent, so a
-  // save's own file_name can't be used to reconstruct the path RetroArch
-  // expects. Only saves tagged with our fixed slot are shim-managed (see
-  // assetSync.ts); for those we rebuild the original filename from the
-  // owning rom's fs_name_no_ext + the save's own (untouched) extension.
-  // Saves from other tools/slots are intentionally left out of the
-  // manifest — see README "Known limitations".
-  const ourSaves = saves.filter((s) => s.slot === config.rommSaveSlot);
   const romCache = new Map<number, string | null>();
   const romName = async (romId: number): Promise<string | null> => {
     if (!romCache.has(romId)) {
@@ -31,20 +32,55 @@ export async function buildServerManifest(): Promise<string> {
     return romCache.get(romId) ?? null;
   };
 
-  const saveEntries = (
-    await Promise.all(
-      ourSaves.map(async (s) => {
-        const base = await romName(s.rom_id);
-        if (!base) return null;
-        return toEntry(`saves/${base}.${s.file_extension}`, s);
-      }),
-    )
-  ).filter((e): e is { path: string; hash: string } => e !== null);
+  // Verified against a live RomM instance: POST /api/saves silently
+  // appends a "[<timestamp>]" suffix to whatever filename is sent, so a
+  // save's own file_name can't be used to reconstruct the path RetroArch
+  // expects — rebuild it from the owning rom's fs_name_no_ext + the save's
+  // own (untouched) extension instead. One save per rom: unlike states,
+  // consoles conventionally have a single .srm/.sav per game, not
+  // multiple numbered slots.
+  const latestSavePerRom = latestByKey(saves, (s) => String(s.rom_id));
+  const saveEntries = await buildEntries(latestSavePerRom, "saves", romName);
 
-  // States are stored under the exact filename we upload — no reconstruction needed.
-  const stateEntries = states.map((s) => toEntry(`states/${s.file_name}`, s));
+  // States commonly have multiple slots per rom (RetroArch names them
+  // "<game>.state", "<game>.state1", "<game>.state2", ...) and RomM has no
+  // slot field for states to group by directly — but file_extension
+  // already isolates exactly that suffix ("state", "state1", ...), since
+  // RomM derives it by splitting on the last dot. Grouping by
+  // (rom_id, file_extension) picks one winner per slot instead of
+  // collapsing every slot down to whichever rom-wide entry is newest, and
+  // naturally folds old differently-named archival entries (which all end
+  // in plain ".state", no digit) into the base/default slot bucket.
+  const latestStatePerRomAndSlot = latestByKey(states, (s) => `${s.rom_id}:${s.file_extension}`);
+  const stateEntries = await buildEntries(latestStatePerRomAndSlot, "states", romName);
 
   return JSON.stringify([...saveEntries, ...stateEntries]);
+}
+
+function latestByKey(assets: RommAsset[], key: (a: RommAsset) => string): RommAsset[] {
+  const groups = new Map<string, RommAsset[]>();
+  for (const asset of assets) {
+    const k = key(asset);
+    const group = groups.get(k);
+    if (group) group.push(asset);
+    else groups.set(k, [asset]);
+  }
+  return [...groups.values()].map(pickLatest);
+}
+
+async function buildEntries(
+  assets: RommAsset[],
+  prefix: "saves" | "states",
+  romName: (romId: number) => Promise<string | null>,
+): Promise<{ path: string; hash: string }[]> {
+  const entries = await Promise.all(
+    assets.map(async (a) => {
+      const base = await romName(a.rom_id);
+      if (!base) return null;
+      return toEntry(`${prefix}/${base}.${a.file_extension}`, a);
+    }),
+  );
+  return entries.filter((e): e is { path: string; hash: string } => e !== null);
 }
 
 function toEntry(path: string, asset: RommAsset) {

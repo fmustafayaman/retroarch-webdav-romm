@@ -7,7 +7,7 @@ import { logger } from "./logger.js";
 import { buildServerManifest } from "./manifest.js";
 import {
   resolveAssetPath,
-  findAssetByFileName,
+  findAssetForDownload,
   downloadAssetContent,
   putAssetContent,
   deleteAssetContent,
@@ -255,7 +255,7 @@ async function handleGetOrHead(
     return;
   }
 
-  const asset = await findAssetByFileName(resolved.kind, resolved.fileName);
+  const asset = await findAssetForDownload(resolved.kind, resolved.fileName);
   if (!asset) {
     res.writeHead(404).end();
     return;
