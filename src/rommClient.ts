@@ -18,6 +18,23 @@ export interface RommRomMatch {
   fs_name_no_ext: string;
 }
 
+export interface RommPlatform {
+  id: number;
+  fs_slug: string;
+  name: string;
+  rom_count: number;
+}
+
+export interface RommRom {
+  id: number;
+  fs_name: string;
+  fs_name_no_ext: string;
+  fs_size_bytes: number;
+  updated_at: string;
+  has_multiple_files: boolean;
+  files: { file_name: string }[];
+}
+
 const authHeader =
   config.rommAuth.kind === "bearer"
     ? `Bearer ${config.rommAuth.token}`
@@ -100,6 +117,62 @@ export async function getRomById(id: number): Promise<RommRomMatch | null> {
     throw new RommApiError("GET", `/api/roms/${id}/simple`, res.status, body);
   }
   return (await res.json()) as RommRomMatch;
+}
+
+export async function listPlatforms(): Promise<RommPlatform[]> {
+  const res = await rommFetchOk(`/api/platforms`);
+  return (await res.json()) as RommPlatform[];
+}
+
+const ROM_PAGE_SIZE = 250;
+// Safety cap so a pathological/misreported `total` can't turn a directory
+// listing into an unbounded loop.
+const ROM_LIST_MAX = 20000;
+
+export async function listRomsForPlatform(platformId: number): Promise<RommRom[]> {
+  const roms: RommRom[] = [];
+  let offset = 0;
+  for (;;) {
+    const qs = new URLSearchParams({
+      platform_ids: String(platformId),
+      limit: String(ROM_PAGE_SIZE),
+      offset: String(offset),
+      with_char_index: "false",
+      with_filter_values: "false",
+      // Needed to get real per-file names (with extension) for
+      // single-nested-file roms — see displayName() in romBrowser.ts.
+      // Without it `files` comes back as an empty array.
+      with_files: "true",
+    });
+    const res = await rommFetchOk(`/api/roms?${qs}`);
+    const data = (await res.json()) as { items: RommRom[]; total: number };
+    roms.push(...data.items);
+    offset += data.items.length;
+    if (data.items.length === 0 || offset >= data.total || offset >= ROM_LIST_MAX) break;
+  }
+  return roms;
+}
+
+/**
+ * Streams a rom's content without buffering it in memory — roms in a
+ * personal library regularly run 300MB-1.5GB+, so unlike the save/state
+ * downloads above (which are small enough to buffer), this hands back the
+ * raw fetch Response for the caller to pipe straight through.
+ *
+ * RomM's content endpoint properly supports Range requests (verified
+ * against a live instance — returns real 206/Content-Range), which matters
+ * a lot at this file size over a tunnel: forwarding the client's Range
+ * header through is what lets iOS Files resume an interrupted download
+ * instead of restarting a 1GB+ transfer from zero.
+ */
+export async function fetchRomContentStream(
+  id: number,
+  fileName: string,
+  range?: string,
+): Promise<Response> {
+  const encoded = encodeURIComponent(fileName);
+  const headers = range ? { Range: range } : undefined;
+  return rommFetchOk(`/api/roms/${id}/content/${encoded}`, { headers });
 }
 
 export async function listSaves(): Promise<RommAsset[]> {

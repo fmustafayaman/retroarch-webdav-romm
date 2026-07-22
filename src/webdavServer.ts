@@ -1,12 +1,23 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { buildServerManifest } from "./manifest.js";
-import { resolveAssetPath, findAssetByFileName, downloadAssetContent, putAssetContent, deleteAssetContent } from "./assetSync.js";
+import {
+  resolveAssetPath,
+  findAssetByFileName,
+  downloadAssetContent,
+  putAssetContent,
+  deleteAssetContent,
+} from "./assetSync.js";
+import { listRomPlatforms, listRomFiles, findRomFile } from "./romBrowser.js";
+import { fetchRomContentStream } from "./rommClient.js";
+import { buildMultistatus, type PropfindEntry } from "./webdavXml.js";
 
 const MANIFEST_PATH = "manifest.server";
 
-const ALLOWED_METHODS = "OPTIONS, GET, PUT, DELETE, MKCOL, MOVE";
+const ALLOWED_METHODS = "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE";
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -44,10 +55,158 @@ async function handleOptions(res: ServerResponse) {
   res.end();
 }
 
-async function handleGet(reqPath: string, res: ServerResponse) {
+/**
+ * PROPFIND is only implemented for the "roms/" tree, which exists purely so
+ * a real WebDAV client (e.g. iOS Files app's "Connect to Server") can
+ * browse and download a copy of the RomM library. RetroArch's own Cloud
+ * Sync client never sends PROPFIND — verified against its source — so
+ * saves/states/manifest.server intentionally aren't listable here; nothing
+ * in that flow depends on directory listings.
+ */
+async function handlePropfind(reqPath: string, req: IncomingMessage, res: ServerResponse) {
+  const depth = req.headers["depth"] === "0" ? 0 : 1; // "1" and "infinity" both treated as one level
+
+  const clean = reqPath.replace(/\/+$/, "");
+  const parts = clean === "" ? [] : clean.split("/");
+
+  let entries: PropfindEntry[] | null;
+  if (parts.length === 0) {
+    entries = depth === 0 ? [rootEntry()] : [rootEntry(), romsRootEntry()];
+  } else if (parts.length === 1 && parts[0] === "roms") {
+    entries = depth === 0 ? [romsRootEntry()] : [romsRootEntry(), ...(await platformEntries())];
+  } else if (parts.length === 2 && parts[0] === "roms") {
+    entries = await platformListing(parts[1], depth);
+  } else if (parts.length === 3 && parts[0] === "roms") {
+    entries = await romFileEntry(parts[1], parts[2]);
+  } else {
+    entries = null;
+  }
+
+  if (!entries) {
+    res.writeHead(404).end();
+    return;
+  }
+
+  const body = buildMultistatus(entries);
+  res.writeHead(207, {
+    "Content-Type": "application/xml; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function rootEntry(): PropfindEntry {
+  return { href: "", isCollection: true, displayName: "" };
+}
+function romsRootEntry(): PropfindEntry {
+  return { href: "roms/", isCollection: true, displayName: "roms" };
+}
+async function platformEntries(): Promise<PropfindEntry[]> {
+  const platforms = await listRomPlatforms();
+  return platforms.map((p) => ({ href: `roms/${p.fsSlug}/`, isCollection: true, displayName: p.name }));
+}
+async function platformListing(slug: string, depth: 0 | 1): Promise<PropfindEntry[] | null> {
+  const platforms = await listRomPlatforms();
+  const platform = platforms.find((p) => p.fsSlug === slug);
+  if (!platform) return null;
+  const self: PropfindEntry = { href: `roms/${slug}/`, isCollection: true, displayName: platform.name };
+  if (depth === 0) return [self];
+
+  const files = await listRomFiles(slug);
+  return [
+    self,
+    ...files.map((f) => ({
+      href: `roms/${slug}/${f.displayName}`,
+      isCollection: false,
+      displayName: f.displayName,
+      // Approximate for multi-file (zipped) roms — RomM reports the sum of
+      // the underlying files, not the final zip's actual byte count. Only
+      // affects what Files app displays while browsing; the real download
+      // (handleRomContent below) always uses the upstream response's own
+      // Content-Length, so the file itself is never truncated/misreported.
+      contentLength: f.sizeBytes,
+      lastModified: new Date(f.updatedAt),
+    })),
+  ];
+}
+async function romFileEntry(slug: string, fileName: string): Promise<PropfindEntry[] | null> {
+  const file = await findRomFile(slug, fileName);
+  if (!file) return null;
+  return [
+    {
+      href: `roms/${slug}/${fileName}`,
+      isCollection: false,
+      displayName: fileName,
+      contentLength: file.sizeBytes,
+      lastModified: new Date(file.updatedAt),
+    },
+  ];
+}
+
+async function handleRomContent(
+  slug: string,
+  fileName: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+  headOnly: boolean,
+) {
+  const file = await findRomFile(slug, fileName);
+  if (!file) {
+    res.writeHead(404).end();
+    return;
+  }
+
+  if (headOnly) {
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": file.sizeBytes,
+      "Accept-Ranges": "bytes",
+    });
+    res.end();
+    return;
+  }
+
+  // Forward Range through to RomM — verified it returns real 206/Content-Range,
+  // which is what lets iOS Files resume an interrupted 300MB-1.5GB+ download
+  // instead of restarting from zero.
+  const upstream = await fetchRomContentStream(file.romId, file.fsName, req.headers.range);
+  const headers: Record<string, string> = { "Content-Type": "application/octet-stream", "Accept-Ranges": "bytes" };
+  const upstreamLength = upstream.headers.get("content-length");
+  if (upstreamLength) headers["Content-Length"] = upstreamLength;
+  const contentRange = upstream.headers.get("content-range");
+  if (contentRange) headers["Content-Range"] = contentRange;
+  res.writeHead(upstream.status, headers);
+
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+  // Roms routinely run 300MB-1.5GB+ — stream straight through rather than
+  // buffering, unlike the (small) save/state downloads below.
+  await pipeline(Readable.fromWeb(upstream.body as never), res);
+}
+
+async function handleGetOrHead(
+  reqPath: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+  headOnly: boolean,
+) {
+  const romParts = reqPath.split("/");
+  if (romParts.length === 3 && romParts[0] === "roms") {
+    return handleRomContent(romParts[1], romParts[2], req, res, headOnly);
+  }
+
   if (reqPath === MANIFEST_PATH) {
+    if (headOnly) {
+      res.writeHead(200, { "Content-Type": "application/json" }).end();
+      return;
+    }
     const body = await buildServerManifest();
-    res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body),
+    });
     res.end(body);
     return;
   }
@@ -61,6 +220,15 @@ async function handleGet(reqPath: string, res: ServerResponse) {
   const asset = await findAssetByFileName(resolved.kind, resolved.fileName);
   if (!asset) {
     res.writeHead(404).end();
+    return;
+  }
+
+  if (headOnly) {
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": asset.file_size_bytes,
+    });
+    res.end();
     return;
   }
 
@@ -131,7 +299,9 @@ async function handleMove(reqPath: string, req: IncomingMessage, res: ServerResp
   // RetroArch only issues MOVE to back up a file to "deleted/<path>-<timestamp>"
   // as a soft-delete when non-destructive delete mode is on. We treat any MOVE
   // whose destination lands under deleted/ as a delete of the source.
-  const destPath = destination ? decodeURIComponent(new URL(String(destination)).pathname).replace(/^\/+/, "") : "";
+  const destPath = destination
+    ? decodeURIComponent(new URL(String(destination)).pathname).replace(/^\/+/, "")
+    : "";
   const resolved = resolveAssetPath(reqPath);
 
   if (resolved && destPath.startsWith("deleted/")) {
@@ -163,8 +333,12 @@ export function createServer() {
       switch (method) {
         case "OPTIONS":
           return await handleOptions(res);
+        case "PROPFIND":
+          return await handlePropfind(reqPath, req, res);
         case "GET":
-          return await handleGet(reqPath, res);
+          return await handleGetOrHead(reqPath, req, res, false);
+        case "HEAD":
+          return await handleGetOrHead(reqPath, req, res, true);
         case "PUT":
           return await handlePut(reqPath, req, res);
         case "DELETE":

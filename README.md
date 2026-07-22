@@ -6,6 +6,11 @@ instance as its backing store for save files and save states. RomM stays the
 single source of truth for saves/states — nothing is stored on a separate
 WebDAV volume.
 
+It also exposes RomM's rom library as a real, browsable WebDAV directory
+tree under `/roms/`, so it can be mounted as a network drive from iOS
+Files (or any WebDAV client) to pull roms onto a device — see "Downloading
+roms" below.
+
 ## Why not a full WebDAV server library
 
 The project brief called for the `webdav-server` npm package (or `wsgidav`).
@@ -19,6 +24,11 @@ individual files. That's a much narrower surface than general-purpose WebDAV
 middleware is built for, so this shim is a small hand-rolled HTTP server
 (`src/webdavServer.ts`) instead — simpler to reason about than fighting a
 PROPFIND-XML-oriented library for verbs it doesn't even use.
+
+The one place real `PROPFIND` support was added is the `/roms/` browsing
+tree (`src/webdavXml.ts` builds the `DAV:multistatus` XML) — that part
+exists purely for generic WebDAV clients like iOS Files, not for
+RetroArch's Cloud Sync, which never touches `/roms/` at all.
 
 ## How it works
 
@@ -64,12 +74,13 @@ PROPFIND-XML-oriented library for verbs it doesn't even use.
   **Disable "Configuration", "Thumbnails", and "System Files" sync in
   RetroArch's Cloud Sync settings** and leave only "Save Files & States" on
   — see Known limitations below.
-- Auth: RetroArch authenticates to the shim with HTTP Basic Auth
-  (`WEBDAV_USERNAME`/`WEBDAV_PASSWORD`). The shim authenticates to RomM with
-  HTTP Basic Auth using a single static RomM account
-  (`ROMM_USERNAME`/`ROMM_PASSWORD`) — RomM accepts Basic auth directly on
-  every endpoint used here, so there's no OAuth2 token/refresh flow to
-  manage for this single-user setup.
+- Auth: RetroArch (and Files/other WebDAV clients) authenticate to the shim
+  with HTTP Basic Auth (`WEBDAV_USERNAME`/`WEBDAV_PASSWORD`). The shim
+  authenticates to RomM with a single static RomM account, either a client
+  token (`ROMM_API_TOKEN`, sent as `Authorization: Bearer`) or
+  `ROMM_USERNAME`/`ROMM_PASSWORD` (sent as HTTP Basic) — RomM accepts both
+  directly on every endpoint used here, so there's no OAuth2 token/refresh
+  flow to manage for this single-user setup.
 
 ## Configuring RetroArch
 
@@ -90,12 +101,79 @@ Then trigger a manual "Sync Now" and check the shim's logs
 (`LOG_LEVEL=debug`) if anything looks wrong — RetroArch's own error message
 is just "Cloud Sync failed" with no detail.
 
+## Downloading roms
+
+RetroArch itself has no way to browse or pull content from an arbitrary
+custom server — its "Online Updater" / buildbot settings are for cores and
+UI assets (thumbnails, overlays, shaders, database files), not games, and
+there's no general "connect to a content server" feature. So getting roms
+from RomM onto a device (especially iOS, which has no direct filesystem
+access from other apps) goes through the platform's own generic WebDAV
+client instead:
+
+1. On iOS: **Files app → Browse → ⋯ → Connect to Server**, enter
+   `https://<your-shim-host>/`, and sign in with `WEBDAV_USERNAME`/`WEBDAV_PASSWORD`
+   (same credentials as Cloud Sync above).
+2. Browse into `roms/<platform>/`, find the game, tap to download (iOS
+   downloads it into Files' local storage / iCloud Drive, your choice).
+3. Move/copy the file into **On My iPhone/iPad → RetroArch** so RetroArch's
+   own content browser picks it up.
+
+This is manual (tap through Files each time), not an automatic "RetroArch
+downloads what it's missing" flow — there isn't one to build on given
+RetroArch's actual capabilities. See `src/romBrowser.ts` and the PROPFIND
+handling in `src/webdavServer.ts`.
+
+A few things verified against a live instance that shaped how `/roms/` is
+built:
+
+- **RomM zips multi-disc/multi-track roms on download** (with an `.m3u`
+  included) but serves single-file roms raw. The listing reflects this —
+  multi-file roms show up as `<name>.zip`, everything else keeps its real
+  extension. Getting the "is it really one file" signal right took two
+  tries: `has_simple_single_file: false` looked like the right check but
+  isn't — a rom stored as one file inside its own subfolder reports that
+  as `false` too (`has_nested_single_file: true`) while still downloading
+  raw, not zipped. Only `has_multiple_files: true` actually triggers
+  zipping. Get this wrong and the shim advertises a `.zip` that's actually
+  a raw `.chd` (or vice versa), which breaks the download in Files.
+- **The real filename for a single-nested-file rom isn't `fs_name`.**
+  `fs_name` for those turned out to be the *folder* name with no
+  extension (e.g. `"Alundra (USA) (v1.1)"`, not `"....chd"`) — the actual
+  filename is on `files[0].file_name`, which the roms list endpoint only
+  populates when the request includes `with_files=true` (confirmed by
+  testing with and without it; omitting it silently returns `files: []`
+  rather than an error, which is an easy way to end up serving
+  extensionless files without noticing).
+- **`search_term` doesn't handle fully tagged filenames** — same fix as
+  the saves matching above, since finding a rom by filename for saves
+  reuses this.
+- **Range requests only work for single-file roms.** RomM properly
+  supports `Range`/`206 Partial Content` on raw single-file downloads
+  (confirmed live), which the shim forwards through so Files can resume an
+  interrupted download. For zipped multi-file roms, RomM ignores the
+  `Range` header and streams the full file with `200 OK` regardless —
+  confirmed live on a ~793MB, 3-file rom. A dropped connection on a
+  multi-GB multi-disc game means starting over from zero; there's no fix
+  on this end since the zip is generated on the fly server-side.
+- **Rom sizes shown while browsing a multi-file rom's folder are
+  approximate.** RomM reports `fs_size_bytes` as the sum of the underlying
+  files, not the size of the zip it actually produces (compression +
+  `.m3u` overhead). Only affects what Files displays before downloading —
+  the actual transfer always uses the real `Content-Length` from RomM's
+  response, so nothing is truncated or misreported once the download
+  starts.
+
 ## Configuration (env vars)
 
 See `.env.example`. All required, no hardcoded secrets in code:
 
-- `ROMM_BASE_URL`, `ROMM_USERNAME`, `ROMM_PASSWORD` — the RomM instance and
-  account whose saves/states get synced.
+- `ROMM_BASE_URL` — the RomM instance. Plus either `ROMM_API_TOKEN` or
+  `ROMM_USERNAME`/`ROMM_PASSWORD` — the RomM account whose saves/states/roms
+  are exposed.
+- `ROMM_SAVE_SLOT` — fixed slot tag the shim uses for saves it creates
+  (default `webdav-shim`). Only change this if running more than one
+  instance of this shim against the same RomM account.
 - `WEBDAV_USERNAME`, `WEBDAV_PASSWORD` — credentials RetroArch authenticates
   with against this shim.
 - `PORT`, `BIND_ADDRESS` — shim's own listen socket (defaults `8080` /
