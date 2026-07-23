@@ -19,8 +19,6 @@ export interface RommRomMatch {
   fs_name_no_ext: string;
   fs_name_no_tags: string;
   name: string;
-  /** RomM's platform slug (e.g. "snes", "psx") — verified present on both `/api/roms` and `/api/roms/{id}/simple` responses (RomM's SimpleRomSchema). Used to guess a default RetroArch core folder for saves/states that arrive with no `emulator` field set — see emulatorNames.ts's `defaultCoreForPlatform`. */
-  platform_fs_slug: string;
 }
 
 export interface RommPlatform {

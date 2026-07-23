@@ -141,7 +141,6 @@ See `.env.example` for the full list with comments. The essentials:
 | `WEBDAV_USERNAME` / `WEBDAV_PASSWORD` | Credentials RetroArch (and any WebDAV client) authenticates with |
 | `ROMM_SAVE_SLOT` | Save slot tag, default `autosave` — leave as-is unless running multiple instances against the same RomM account |
 | `PSP_SERIAL_MAP` | Optional PSP title overrides — see above |
-| `DEFAULT_CORE_BY_PLATFORM` | Optional per-platform core override for saves/states made outside RetroArch (e.g. RomM's own web player) — see "Details worth knowing" below |
 | `PORT`, `BIND_ADDRESS` | Where the server listens (default `8080`, `0.0.0.0`) |
 | `LOG_LEVEL` | `trace\|debug\|info\|warn\|error` |
 | `CACHE_TTL_SECONDS` | How long RomM listing results are cached in memory (default `30`, `0` disables) — keeps browsing fast without hammering RomM |
@@ -248,22 +247,6 @@ sync never touches it.
   fix is a timestamp stamped into the filename actually sent to RomM;
   RetroArch never sees this, since the shim always reconstructs the plain
   filename it expects.
-- **Saves/states made by playing a game in RomM's own web UI (EmulatorJS)
-  show up in RetroArch too, not just ones made in RetroArch itself.**
-  Verified live that RomM's browser player never sets the `emulator`
-  field on what it uploads (unlike this shim, or RetroArch's own native
-  sync) — with nothing to translate through the table above, those
-  entries would otherwise sit at a flat path RetroArch's local sync never
-  recognizes as matching its own nested one, making them invisible to
-  RetroArch even though they're right there in RomM. When `emulator` is
-  missing entirely, the shim instead guesses a default RetroArch core
-  folder from the rom's *platform* (`defaultCoreForPlatform` in
-  `emulatorNames.ts`, e.g. `snes` → `Snes9x`) — good enough to place the
-  file where RetroArch actually expects it for the common case, without
-  needing to know which specific core produced it. Override the guess per
-  platform with `DEFAULT_CORE_BY_PLATFORM` if you use a different core
-  than the built-in default (e.g. bsnes instead of Snes9x) — see
-  Configuration below.
 - **RomM's rom search doesn't handle fully tagged filenames** like
   `Silent Hill (Europe) (En,Fr,De,Es,It)` — it's relevance search over the
   bare title, not substring matching. Tags are stripped before searching,

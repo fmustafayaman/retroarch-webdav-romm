@@ -52,17 +52,6 @@ export const config = {
   // pruning (unlimited history, the old default).
   historyKeepCount: Number(process.env.HISTORY_KEEP_COUNT ?? 20),
 
-  // RomM platform slug (e.g. "snes") -> RetroArch core folder name (e.g.
-  // "Snes9x"), overriding/extending the built-in defaults in
-  // emulatorNames.ts. Only matters for saves/states with no `emulator`
-  // field at all (e.g. made via RomM's own web player) — see
-  // `defaultCoreForPlatform`. JSON object, e.g. {"snes":"bsnes"} if you
-  // don't use Snes9x.
-  defaultCoreByPlatform: JSON.parse(process.env.DEFAULT_CORE_BY_PLATFORM ?? "{}") as Record<
-    string,
-    string
-  >,
-
   // PSP serial (e.g. "ULUS10336") -> rom title, for matching a PPSSPP save
   // folder to a RomM rom. RomM has no PSP serial field to look this up
   // automatically (checked), so this is required for the *first* sync of
