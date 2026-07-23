@@ -73,6 +73,17 @@ RetroArch's Cloud Sync, which never touches `/roms/` at all.
     manifest path. This works for *any* entry with the field set, not just
     ones this shim uploaded, so it's correct from the very first sync —
     no "wait for the shim's own upload to self-correct" caveat needed.
+  - **RetroArch's auto-savestate filename is `<game>.state.auto` — a
+    two-segment suffix, not a single extension.** Verified live: naive
+    last-dot splitting (`path.extname`) turns this into
+    base=`"<game>.state"`, suffix=`"auto"`, which fails rom lookup (no rom
+    is titled `"<game>.state"`) and, separately, would mis-reconstruct the
+    manifest path as `<game>.auto` instead of `<game>.state.auto` — RomM's
+    own `file_extension` field has the exact same problem, since RomM
+    derives it the same naive way. `splitAssetFileName` in
+    `src/assetSync.ts` special-cases this (matching the same fix in
+    romm-retroarch-sync); numbered slots (`.state1`–`.state9`) and save
+    extensions are single-segment and unaffected.
   - **Every upload creates a new history entry — nothing is ever
     overwritten in place.** `GET` always serves back whichever entry for
     that rom/slot was updated most recently; a `PUT` never touches an

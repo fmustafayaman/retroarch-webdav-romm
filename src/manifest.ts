@@ -1,5 +1,5 @@
 import { getRomById, listSaves, listStates, type RommAsset } from "./rommClient.js";
-import { pickLatest } from "./assetSync.js";
+import { pickLatest, splitAssetFileName, stripShimStamp } from "./assetSync.js";
 import { toRetroArchDirName } from "./emulatorNames.js";
 
 /**
@@ -36,24 +36,30 @@ export async function buildServerManifest(): Promise<string> {
   // Verified against a live RomM instance: POST /api/saves silently
   // appends a "[<timestamp>]" suffix to whatever filename is sent, so a
   // save's own file_name can't be used to reconstruct the path RetroArch
-  // expects — rebuild it from the owning rom's fs_name_no_ext + the save's
-  // own (untouched) extension instead. One save per rom: unlike states,
-  // consoles conventionally have a single .srm/.sav per game, not
-  // multiple numbered slots.
+  // expects — rebuild it from the owning rom's fs_name_no_ext + RomM's own
+  // (untouched, simple, single-segment) file_extension instead. One save
+  // per rom: unlike states, consoles conventionally have a single
+  // .srm/.sav per game, not multiple numbered slots.
   const latestSavePerRom = latestByKey(saves, (s) => String(s.rom_id));
-  const saveEntries = await buildEntries(latestSavePerRom, "saves", romName);
+  const saveEntries = await buildEntries(latestSavePerRom, "saves", romName, (a) => a.file_extension);
 
   // States commonly have multiple slots per rom (RetroArch names them
-  // "<game>.state", "<game>.state1", "<game>.state2", ...) and RomM has no
-  // slot field for states to group by directly — but file_extension
-  // already isolates exactly that suffix ("state", "state1", ...), since
-  // RomM derives it by splitting on the last dot. Grouping by
-  // (rom_id, file_extension) picks one winner per slot instead of
-  // collapsing every slot down to whichever rom-wide entry is newest, and
-  // naturally folds old differently-named archival entries (which all end
-  // in plain ".state", no digit) into the base/default slot bucket.
-  const latestStatePerRomAndSlot = latestByKey(states, (s) => `${s.rom_id}:${s.file_extension}`);
-  const stateEntries = await buildEntries(latestStatePerRomAndSlot, "states", romName);
+  // "<game>.state", "<game>.state1", "<game>.state2", "<game>.state.auto",
+  // ...) and RomM has no slot field for states to group by directly.
+  // RomM's own `file_extension` isolates most of these correctly (it's a
+  // last-dot split) EXCEPT the auto-savestate case: RetroArch's
+  // ".state.auto" is a two-segment suffix, and RomM's naive split reports
+  // file_extension="auto", which would collapse it into the same bucket
+  // as a plain numeric slot named literally "auto" (impossible, but
+  // illustrates the field can't be trusted here) and reconstruct the
+  // wrong path ("<game>.auto" instead of "<game>.state.auto") — verified
+  // live. Deriving the suffix ourselves via `splitAssetFileName` (after
+  // stripping our own upload-uniqueness stamp, if present) handles this
+  // correctly, the same logic already used to resolve which rom a
+  // save/state belongs to.
+  const stateSuffix = (a: RommAsset) => splitAssetFileName(stripShimStamp(a.file_name)).suffix;
+  const latestStatePerRomAndSlot = latestByKey(states, (s) => `${s.rom_id}:${stateSuffix(s)}`);
+  const stateEntries = await buildEntries(latestStatePerRomAndSlot, "states", romName, stateSuffix);
 
   return JSON.stringify([...saveEntries, ...stateEntries]);
 }
@@ -73,6 +79,7 @@ async function buildEntries(
   assets: RommAsset[],
   prefix: "saves" | "states",
   romName: (romId: number) => Promise<string | null>,
+  suffixOf: (asset: RommAsset) => string,
 ): Promise<{ path: string; hash: string }[]> {
   const entries = await Promise.all(
     assets.map(async (a) => {
@@ -91,7 +98,7 @@ async function buildEntries(
       // than round-tripping raw strings fixes it for any entry, not just
       // ones this shim uploaded.
       const dir = a.emulator ? `${prefix}/${toRetroArchDirName(a.emulator)}` : prefix;
-      return toEntry(`${dir}/${base}.${a.file_extension}`, a);
+      return toEntry(`${dir}/${base}.${suffixOf(a)}`, a);
     }),
   );
   return entries.filter((e): e is { path: string; hash: string } => e !== null);

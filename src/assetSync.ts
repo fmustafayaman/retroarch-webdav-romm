@@ -46,13 +46,34 @@ export function resolveAssetPath(webdavPath: string): ResolvedAssetPath | null {
   return { kind: top, fileName: path.posix.basename(clean), emulator };
 }
 
+/**
+ * Splits a save/state filename into its game-title base and its
+ * "suffix" (extension, in the loose RetroArch sense).
+ *
+ * Verified live that RetroArch's auto-savestate filename is literally
+ * "<content>.state.auto" — a two-segment suffix, not a single extension.
+ * Naive last-dot splitting (`path.extname`) turns this into
+ * base="<content>.state", suffix="auto", which then fails rom lookup (no
+ * rom is titled "<content>.state") and would mis-reconstruct the manifest
+ * path as "<content>.auto" instead of "<content>.state.auto". Numbered
+ * slots ("<content>.state1"..".state9") and save extensions
+ * ("<content>.srm" etc.) are single-segment and unaffected — only
+ * ".state.auto" needs this special case.
+ */
+export function splitAssetFileName(fileName: string): { base: string; suffix: string } {
+  if (/\.state\.auto$/i.test(fileName)) {
+    return { base: fileName.slice(0, -".state.auto".length), suffix: "state.auto" };
+  }
+  const ext = path.posix.extname(fileName);
+  return { base: path.posix.basename(fileName, ext), suffix: ext.replace(/^\./, "") };
+}
+
 async function listAssets(kind: AssetKind): Promise<RommAsset[]> {
   return kind === "saves" ? listSaves() : listStates();
 }
 
 function resolveRomForFileName(fileName: string): Promise<RommRomMatch | null> {
-  const baseName = path.posix.basename(fileName, path.posix.extname(fileName));
-  return findRomByBaseName(baseName);
+  return findRomByBaseName(splitAssetFileName(fileName).base);
 }
 
 /**
@@ -101,6 +122,16 @@ export function pickLatest(assets: RommAsset[]): RommAsset {
 }
 
 /**
+ * Recovers the exact WebDAV filename a shim-created upload was made
+ * under, by stripping the `withUniqueSuffix` timestamp stamp — or returns
+ * `asset.file_name` unchanged if it doesn't match that pattern (a
+ * foreign/pre-existing entry).
+ */
+function stripShimStamp(fileName: string): string {
+  return fileName.replace(/\.\d{8}T\d{6}Z$/, "");
+}
+
+/**
  * Whether the shim itself created `asset` — never true for a
  * foreign/pre-existing entry. Used by `deleteAssetContent` below (so a
  * delete can never remove history it didn't create) and by
@@ -116,30 +147,29 @@ export function pickLatest(assets: RommAsset[]): RommAsset {
  * creation — matched on that plus rom_id.
  *
  * States: have no slot field, so a shim-owned state is recognized by its
- * `withUniqueSuffix` naming pattern (`<base>-<timestamp>Z<ext>`) instead —
- * old, differently-named archival entries never match that pattern.
+ * `withUniqueSuffix` naming pattern (the exact WebDAV filename, followed
+ * by our timestamp stamp) instead — old, differently-named archival
+ * entries never match that pattern.
  */
-export function isShimOwned(kind: AssetKind, asset: RommAsset, base: string): boolean {
+export function isShimOwned(kind: AssetKind, asset: RommAsset, fileName: string): boolean {
   if (kind === "saves") return asset.slot === config.rommSaveSlot;
-  const pattern = ownUploadPattern(base, `.${asset.file_extension}`);
-  return pattern.test(asset.file_name);
+  return ownUploadPattern(fileName).test(asset.file_name);
 }
 
 async function findManagedAssets(kind: AssetKind, fileName: string): Promise<RommAsset[]> {
   const rom = await resolveRomForFileName(fileName);
   if (!rom) return [];
 
-  const base = path.posix.basename(fileName, path.posix.extname(fileName));
   const assets = await listAssets(kind);
-  return assets.filter((a) => a.rom_id === rom.id && isShimOwned(kind, a, base));
+  return assets.filter((a) => a.rom_id === rom.id && isShimOwned(kind, a, fileName));
 }
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function ownUploadPattern(base: string, ext: string): RegExp {
-  return new RegExp(`^${escapeRegExp(base)}-\\d{8}T\\d{6}Z${escapeRegExp(ext)}$`);
+function ownUploadPattern(fileName: string): RegExp {
+  return new RegExp(`^${escapeRegExp(fileName)}\\.\\d{8}T\\d{6}Z$`);
 }
 
 export async function downloadAssetContent(kind: AssetKind, id: number): Promise<Buffer> {
@@ -166,7 +196,7 @@ export async function downloadAssetContent(kind: AssetKind, id: number): Promise
  * give RomM a filename it's never seen before by stamping a timestamp
  * into it — RetroArch never sees this name (only WebDAV path segments
  * round-trip back to it, and the manifest/download path already
- * reconstructs the correct local filename from the rom + asset extension,
+ * reconstructs the correct local filename from the rom + asset suffix,
  * not from whatever RomM stored it as).
  */
 export async function putAssetContent(
@@ -177,8 +207,8 @@ export async function putAssetContent(
 ): Promise<void> {
   const rom = await resolveRomForFileName(fileName);
   if (!rom) {
-    const baseName = path.posix.basename(fileName, path.posix.extname(fileName));
-    throw new Error(`No RomM rom found matching filename base "${baseName}" for ${fileName}`);
+    const { base } = splitAssetFileName(fileName);
+    throw new Error(`No RomM rom found matching filename base "${base}" for ${fileName}`);
   }
 
   // Normalize RetroArch's own directory name ("Snes9x") to RomM's
@@ -189,7 +219,7 @@ export async function putAssetContent(
   // set, not just ones this shim uploaded.
   const rommEmulator = emulator ? toRommEmulator(emulator) : null;
 
-  const uniqueFileName = withUniqueSuffix(fileName);
+  const uniqueFileName = withUniqueSuffix(kind, fileName);
   logger.debug(
     { kind, fileName, uniqueFileName, romId: rom.id, emulator: rommEmulator },
     "uploading new romm asset",
@@ -198,10 +228,34 @@ export async function putAssetContent(
   else await uploadNewState(rom.id, uniqueFileName, content, rommEmulator);
 }
 
-function withUniqueSuffix(fileName: string): string {
+/**
+ * Stamps a timestamp onto the filename to guarantee RomM sees one it's
+ * never seen before — see `putAssetContent` above for why that's needed.
+ *
+ * States: appended after the whole original filename, rather than
+ * splitting out an "extension" first, which sidesteps ever needing to
+ * understand a filename's structure here (in particular RetroArch's
+ * compound ".state.auto" suffix — see `splitAssetFileName`).
+ * `stripShimStamp` recovers the exact original filename by just cutting
+ * this stamp back off.
+ *
+ * Saves: inserted *before* the extension instead (`Game-STAMP.srm`, not
+ * `Game.srm.STAMP`) — verified live that `POST /api/saves` additionally
+ * inserts its own `[<timestamp>]` bracket right before the final
+ * extension segment regardless of what's sent, and manifest.ts's save
+ * path (unlike its state path) still relies on RomM's own reported
+ * `file_extension` to reconstruct the suffix. Appending our stamp after
+ * the extension pushed RomM's own bracket-plus-our-stamp into that final
+ * segment, corrupting `file_extension` into the stamp itself and
+ * reconstructing the manifest path as e.g. "Game.20260723T104825Z"
+ * instead of "Game.srm". Saves never have a compound suffix like states'
+ * ".state.auto", so splitting out a plain extension here is safe.
+ */
+function withUniqueSuffix(kind: AssetKind, fileName: string): string {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  if (kind === "states") return `${fileName}.${stamp}`;
   const ext = path.posix.extname(fileName);
   const base = path.posix.basename(fileName, ext);
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
   return `${base}-${stamp}${ext}`;
 }
 
@@ -214,3 +268,5 @@ export async function deleteAssetContent(kind: AssetKind, fileName: string): Pro
   else await deleteStates([target.id]);
   return true;
 }
+
+export { stripShimStamp };
