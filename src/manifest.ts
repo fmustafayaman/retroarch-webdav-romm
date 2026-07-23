@@ -1,4 +1,12 @@
-import { getRomById, listSaves, listStates, type RommAsset } from "./rommClient.js";
+import crypto from "node:crypto";
+import {
+  getRomById,
+  listSaves,
+  listStates,
+  downloadSave,
+  downloadState,
+  type RommAsset,
+} from "./rommClient.js";
 import { assetHistoryKey, sortByRecency, splitAssetFileName, stripShimStamp } from "./assetSync.js";
 import { toRetroArchDirName } from "./emulatorNames.js";
 import { buildPspManifestEntries, isPspBundleFileName } from "./pspSave.js";
@@ -154,7 +162,7 @@ async function buildEntries(
     assets.map(async (a) => {
       const base = await romName(a.rom_id);
       if (!base) return null;
-      return toEntry(`${dirFor(prefix, a)}/${base}.${suffixOf(a)}`, a);
+      return toEntry(`${dirFor(prefix, a)}/${base}.${suffixOf(a)}`, a, prefix);
     }),
   );
   return entries.filter((e): e is ManifestEntry => e !== null);
@@ -175,11 +183,11 @@ async function buildHistoryEntries(
     const base = await romName(sorted[0]!.rom_id);
     if (!base) continue;
 
-    sorted.forEach((a, i) => {
+    for (const [i, a] of sorted.entries()) {
       const suffix = suffixOf(a);
       const name = i === 0 ? `${base}.${suffix}` : `${base} [${historyLabel(a)}].${suffix}`;
-      entries.push(toEntry(`${dirFor(prefix, a)}/${name}`, a));
-    });
+      entries.push(await toEntry(`${dirFor(prefix, a)}/${name}`, a, prefix));
+    }
   }
 
   return entries;
@@ -210,14 +218,50 @@ function dirFor(prefix: "saves" | "states", asset: RommAsset): string {
   return asset.emulator ? `${prefix}/${toRetroArchDirName(asset.emulator)}` : prefix;
 }
 
-function toEntry(path: string, asset: RommAsset): ManifestEntry {
+/**
+ * Real per-asset content MD5s, cached forever (not TTL-based like
+ * rommClient.ts's listing cache) — a given RomM asset row is immutable
+ * once created (every write here makes a new row, see assetSync.ts), so
+ * its hash can never go stale.
+ */
+const realHashCache = new Map<string, string>();
+
+/**
+ * RomM's `content_hash` is null on effectively every row on this
+ * instance — verified live: not one save/state across the whole library
+ * had it set, suggesting RomM's hashing background job has never run
+ * here. The synthetic `size-updated_at` fallback this used to fall back
+ * to is not a real content hash and can never equal the real MD5
+ * RetroArch computes locally over the actual bytes
+ * (`task_cloud_sync_md5_rfile` in RetroArch's own source) — the mismatch
+ * was silently masked as long as RetroArch's own local sync history
+ * (`manifest.local`) still held a matching copy of that same synthetic
+ * string from a prior sync, but the moment that history was reset (or
+ * simply never existed, e.g. a fresh device), RetroArch's 3-way diff
+ * degrades to a strict real-hash-vs-real-hash comparison with no
+ * baseline to fall back on — synthetic-vs-real can never match, so
+ * *every* affected file reports as an unresolvable "conflict" and never
+ * syncs again, reproduced live. Downloading and hashing for real here
+ * is the only fix: this shim's reported hash has to be the same MD5
+ * RetroArch itself would compute, not a stand-in.
+ */
+async function realContentHash(kind: "saves" | "states", asset: RommAsset): Promise<string> {
+  if (asset.content_hash) return asset.content_hash;
+
+  const cacheKey = `${kind}:${asset.id}`;
+  const cached = realHashCache.get(cacheKey);
+  if (cached) return cached;
+
+  const content = kind === "saves" ? await downloadSave(asset.id) : await downloadState(asset.id);
+  const hash = crypto.createHash("md5").update(content).digest("hex");
+  realHashCache.set(cacheKey, hash);
+  return hash;
+}
+
+async function toEntry(path: string, asset: RommAsset, kind: "saves" | "states"): Promise<ManifestEntry> {
   return {
     path,
-    // content_hash may be null on older RomM rows that predate hashing;
-    // fall back to a size+mtime fingerprint so the entry still round-trips
-    // through a diff (TODO: this fallback can't detect same-size same-second
-    // edits — a real fix means RomM guaranteeing content_hash is always set).
-    hash: asset.content_hash ?? `${asset.file_size_bytes}-${asset.updated_at}`,
+    hash: await realContentHash(kind, asset),
     size: asset.file_size_bytes,
     updatedAt: asset.updated_at,
   };
