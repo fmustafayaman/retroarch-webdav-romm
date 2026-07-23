@@ -110,6 +110,18 @@ What you see always matches what RetroArch would sync, because it's built
 from the same data. For PPSSPP saves, you'll see each individual file
 inside a save bundle rather than one opaque zip.
 
+**Every save/state you've ever synced is there, not just the latest one.**
+RomM keeps every upload as its own row, so if you've made 10 manual states
+for a game, you'll see all 10 — the current one under its normal name
+(`Chrono Trigger (USA).state`), older ones alongside it with a date and id
+tacked on (`Chrono Trigger (USA) [2026-07-20 10-30-00 #145].state`), newest
+first. Download whichever one you want; to actually use it in RetroArch,
+rename the file back to the plain name and drop it into RetroArch's local
+save folder — RetroArch itself has no concept of "restore an older cloud
+save," so this is a manual step. (PPSSPP saves are the one exception —
+only the current bundle exists, by design; see the PSP section above for
+why.)
+
 **A note on speed:** browsing can feel slow on iOS specifically, because
 Apple's Files app quietly checks for a hidden companion file for every
 single item it lists, one at a time. This is harmless (nothing is created

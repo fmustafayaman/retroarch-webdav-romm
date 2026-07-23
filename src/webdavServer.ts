@@ -4,16 +4,22 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
-import { buildServerManifest, listSaveStateEntries, type ManifestEntry } from "./manifest.js";
+import {
+  buildServerManifest,
+  listSaveStateHistoryEntries,
+  parseHistoryAssetId,
+  type ManifestEntry,
+} from "./manifest.js";
 import {
   resolveAssetPath,
   findAssetForDownload,
   downloadAssetContent,
   putAssetContent,
   deleteAssetContent,
+  type AssetKind,
 } from "./assetSync.js";
 import { listRomPlatforms, listRomFiles, findRomFile } from "./romBrowser.js";
-import { fetchRomContentStream } from "./rommClient.js";
+import { fetchRomContentStream, listSaves, listStates, type RommAsset } from "./rommClient.js";
 import { buildMultistatus, type PropfindEntry } from "./webdavXml.js";
 import { resolvePspPath, getPspFile, putPspFile } from "./pspSave.js";
 
@@ -216,7 +222,7 @@ function toFileEntry(entry: ManifestEntry): PropfindEntry {
  */
 async function saveStateListing(parts: string[], depth: 0 | 1): Promise<PropfindEntry[] | null> {
   const clean = parts.join("/");
-  const allEntries = await listSaveStateEntries();
+  const allEntries = await listSaveStateHistoryEntries();
 
   const exactFile = parts.length > 1 ? allEntries.find((e) => e.path === clean) : undefined;
   if (exactFile) return [toFileEntry(exactFile)];
@@ -292,6 +298,11 @@ async function handleRomContent(
   await pipeline(Readable.fromWeb(upstream.body as never), res);
 }
 
+async function findAssetById(kind: AssetKind, id: number): Promise<RommAsset | null> {
+  const assets = kind === "saves" ? await listSaves() : await listStates();
+  return assets.find((a) => a.id === id) ?? null;
+}
+
 async function handleGetOrHead(
   reqPath: string,
   req: IncomingMessage,
@@ -344,7 +355,17 @@ async function handleGetOrHead(
     return;
   }
 
-  const asset = await findAssetForDownload(resolved.kind, resolved.fileName);
+  // Files browsed via saveStateListing (PROPFIND) for anything but the
+  // current entry carry a "#<id>" marker in their filename — see
+  // manifest.ts's listSaveStateHistoryEntries. Serve that exact RomM row
+  // directly rather than the usual "newest for this rom" lookup, so
+  // downloading an older save/state from a WebDAV client actually gets
+  // the one you clicked, not whatever's newest.
+  const historyId = parseHistoryAssetId(resolved.fileName);
+  const asset =
+    historyId !== null
+      ? await findAssetById(resolved.kind, historyId)
+      : await findAssetForDownload(resolved.kind, resolved.fileName);
   if (!asset) {
     res.writeHead(404).end();
     return;
