@@ -79,6 +79,45 @@ async function rommFetchOk(path: string, init: RequestInit = {}): Promise<Respon
 }
 
 /**
+ * TTL cache (config.CACHE_TTL_SECONDS, default 30s) plus in-flight
+ * deduplication for read-only listing calls. Verified live this matters a
+ * lot more than the config comment implied: a single WebDAV client browse
+ * of saves/states/roms fires a burst of near-simultaneous PROPFIND
+ * requests (including macOS/iOS's own "._<name>" AppleDouble metadata
+ * probes for every entry), and each one — with no caching — re-fetched
+ * /api/platforms, /api/roms per platform, and /api/saves+/api/states from
+ * scratch, several of them literally millisecond-identical concurrent
+ * duplicates. That's what made browsing feel slow. Set CACHE_TTL_SECONDS=0
+ * to disable and always hit RomM fresh.
+ */
+const cache = new Map<string, { expires: number; value: unknown }>();
+const inFlight = new Map<string, Promise<unknown>>();
+
+async function cached<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  if (config.cacheTtlSeconds <= 0) return fn();
+
+  const hit = cache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.value as T;
+
+  const pending = inFlight.get(key);
+  if (pending) return pending as Promise<T>;
+
+  const promise = fn()
+    .then((value) => {
+      cache.set(key, { expires: Date.now() + config.cacheTtlSeconds * 1000, value });
+      return value;
+    })
+    .finally(() => inFlight.delete(key));
+  inFlight.set(key, promise);
+  return promise;
+}
+
+/** Called after any save/state upload or delete so a client that lists right after a write this shim just made sees it immediately, instead of waiting out the TTL. */
+function invalidateAssetCache(kind: "saves" | "states"): void {
+  cache.delete(kind);
+}
+
+/**
  * RomM's search_term is a fuzzy/relevance search over the bare title, not a
  * substring match — passing it a fully tagged filename like
  * "Silent Hill (Europe) (En,Fr,De,Es,It)" reliably returns zero results
@@ -118,18 +157,22 @@ export async function findRomByBaseName(baseName: string): Promise<RommRomMatch 
 
 /** Used to recover a rom's canonical filename when building the manifest (see manifest.ts). */
 export async function getRomById(id: number): Promise<RommRomMatch | null> {
-  const res = await rommFetch(`/api/roms/${id}/simple`);
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new RommApiError("GET", `/api/roms/${id}/simple`, res.status, body);
-  }
-  return (await res.json()) as RommRomMatch;
+  return cached(`rom:${id}`, async () => {
+    const res = await rommFetch(`/api/roms/${id}/simple`);
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new RommApiError("GET", `/api/roms/${id}/simple`, res.status, body);
+    }
+    return (await res.json()) as RommRomMatch;
+  });
 }
 
 export async function listPlatforms(): Promise<RommPlatform[]> {
-  const res = await rommFetchOk(`/api/platforms`);
-  return (await res.json()) as RommPlatform[];
+  return cached("platforms", async () => {
+    const res = await rommFetchOk(`/api/platforms`);
+    return (await res.json()) as RommPlatform[];
+  });
 }
 
 const ROM_PAGE_SIZE = 250;
@@ -138,27 +181,29 @@ const ROM_PAGE_SIZE = 250;
 const ROM_LIST_MAX = 20000;
 
 export async function listRomsForPlatform(platformId: number): Promise<RommRom[]> {
-  const roms: RommRom[] = [];
-  let offset = 0;
-  for (;;) {
-    const qs = new URLSearchParams({
-      platform_ids: String(platformId),
-      limit: String(ROM_PAGE_SIZE),
-      offset: String(offset),
-      with_char_index: "false",
-      with_filter_values: "false",
-      // Needed to get real per-file names (with extension) for
-      // single-nested-file roms — see displayName() in romBrowser.ts.
-      // Without it `files` comes back as an empty array.
-      with_files: "true",
-    });
-    const res = await rommFetchOk(`/api/roms?${qs}`);
-    const data = (await res.json()) as { items: RommRom[]; total: number };
-    roms.push(...data.items);
-    offset += data.items.length;
-    if (data.items.length === 0 || offset >= data.total || offset >= ROM_LIST_MAX) break;
-  }
-  return roms;
+  return cached(`roms:${platformId}`, async () => {
+    const roms: RommRom[] = [];
+    let offset = 0;
+    for (;;) {
+      const qs = new URLSearchParams({
+        platform_ids: String(platformId),
+        limit: String(ROM_PAGE_SIZE),
+        offset: String(offset),
+        with_char_index: "false",
+        with_filter_values: "false",
+        // Needed to get real per-file names (with extension) for
+        // single-nested-file roms — see displayName() in romBrowser.ts.
+        // Without it `files` comes back as an empty array.
+        with_files: "true",
+      });
+      const res = await rommFetchOk(`/api/roms?${qs}`);
+      const data = (await res.json()) as { items: RommRom[]; total: number };
+      roms.push(...data.items);
+      offset += data.items.length;
+      if (data.items.length === 0 || offset >= data.total || offset >= ROM_LIST_MAX) break;
+    }
+    return roms;
+  });
 }
 
 /**
@@ -184,13 +229,17 @@ export async function fetchRomContentStream(
 }
 
 export async function listSaves(): Promise<RommAsset[]> {
-  const res = await rommFetchOk(`/api/saves`);
-  return (await res.json()) as RommAsset[];
+  return cached("saves", async () => {
+    const res = await rommFetchOk(`/api/saves`);
+    return (await res.json()) as RommAsset[];
+  });
 }
 
 export async function listStates(): Promise<RommAsset[]> {
-  const res = await rommFetchOk(`/api/states`);
-  return (await res.json()) as RommAsset[];
+  return cached("states", async () => {
+    const res = await rommFetchOk(`/api/states`);
+    return (await res.json()) as RommAsset[];
+  });
 }
 
 async function downloadAsset(kind: "saves" | "states", id: number): Promise<Buffer> {
@@ -226,6 +275,7 @@ async function uploadNewAsset(
   // every single sync.
   if (emulator) qs.set("emulator", emulator);
   const res = await rommFetchOk(`/api/${kind}?${qs}`, { method: "POST", body: form });
+  invalidateAssetCache(kind);
   return (await res.json()) as RommAsset;
 }
 
@@ -249,6 +299,7 @@ async function deleteAssets(kind: "saves" | "states", ids: number[]): Promise<vo
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  invalidateAssetCache(kind);
 }
 
 export const deleteSaves = (ids: number[]) => deleteAssets("saves", ids);
