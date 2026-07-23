@@ -15,6 +15,7 @@ import {
 import { listRomPlatforms, listRomFiles, findRomFile } from "./romBrowser.js";
 import { fetchRomContentStream } from "./rommClient.js";
 import { buildMultistatus, type PropfindEntry } from "./webdavXml.js";
+import { resolvePspPath, getPspFile, putPspFile } from "./pspSave.js";
 
 const MANIFEST_PATH = "manifest.server";
 
@@ -249,6 +250,27 @@ async function handleGetOrHead(
     return;
   }
 
+  const psp = resolvePspPath(reqPath);
+  if (psp === "ignore") {
+    res.writeHead(404).end();
+    return;
+  }
+  if (psp) {
+    const data = await getPspFile(psp);
+    if (!data) {
+      res.writeHead(404).end();
+      return;
+    }
+    if (headOnly) {
+      res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": data.length });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": data.length });
+    res.end(data);
+    return;
+  }
+
   const resolved = resolveAssetPath(reqPath);
   if (!resolved) {
     res.writeHead(404).end();
@@ -288,6 +310,23 @@ async function handlePut(reqPath: string, req: IncomingMessage, res: ServerRespo
     return;
   }
 
+  const psp = resolvePspPath(reqPath);
+  if (psp === "ignore") {
+    logger.debug({ path: reqPath }, "PSP engine cache file, not save data — discarding");
+    res.writeHead(204).end();
+    return;
+  }
+  if (psp) {
+    try {
+      await putPspFile(psp, body);
+      res.writeHead(201).end();
+    } catch (err) {
+      logger.error({ err, path: reqPath }, "failed to upload PSP save bundle to romm");
+      res.writeHead(502).end();
+    }
+    return;
+  }
+
   const resolved = resolveAssetPath(reqPath);
   if (!resolved) {
     logger.warn(
@@ -309,6 +348,14 @@ async function handlePut(reqPath: string, req: IncomingMessage, res: ServerRespo
 }
 
 async function handleDelete(reqPath: string, res: ServerResponse) {
+  // Best-effort no-op — deleting a single member out of a PSP save bundle
+  // isn't implemented (RetroArch treats cloud sync deletes as best-effort
+  // anyway, matching the rest of this shim's DELETE handling).
+  if (resolvePspPath(reqPath)) {
+    res.writeHead(204).end();
+    return;
+  }
+
   const resolved = resolveAssetPath(reqPath);
   if (!resolved) {
     res.writeHead(204).end();

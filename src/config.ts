@@ -44,4 +44,11 @@ export const config = {
   // to avoid hammering RomM with repeat requests during a single RetroArch
   // sync pass (which can touch dozens of files back-to-back).
   cacheTtlSeconds: Number(process.env.CACHE_TTL_SECONDS ?? 30),
+
+  // PSP serial (e.g. "ULUS10336") -> rom title, for matching a PPSSPP save
+  // folder to a RomM rom. RomM has no PSP serial field to look this up
+  // automatically (checked), so this is required for the *first* sync of
+  // each PSP game's save — see pspSave.ts. JSON object, e.g.
+  // {"ULUS10336":"Crisis Core - Final Fantasy VII"}.
+  pspSerialMap: JSON.parse(process.env.PSP_SERIAL_MAP ?? "{}") as Record<string, string>,
 };

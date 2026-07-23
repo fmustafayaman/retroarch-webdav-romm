@@ -146,6 +146,52 @@ RetroArch's Cloud Sync, which never touches `/roms/` at all.
   directly on every endpoint used here, so there's no OAuth2 token/refresh
   flow to manage for this single-user setup.
 
+## PSP (PPSSPP) saves
+
+Unlike every other core, PPSSPP doesn't write a single save file per game —
+it mirrors a real PSP memory stick under RetroArch's own saves directory:
+`saves/<core>/PSP/SAVEDATA/<slot>/` holds several small files (PARAM.SFO,
+the actual save data, ICON0.PNG, PIC1.PNG, ...) that only make sense
+together, and `saves/<core>/PSP/SYSTEM/CACHE/` holds pure engine caches
+(shader caches etc., named by the game's serial, e.g.
+`ULUS10336.vkshadercache`) with no save data in them at all — verified
+live against real PPSSPP sync traffic. `src/pspSave.ts` handles this
+separately from every other save/state:
+
+- **SYSTEM/CACHE files are silently discarded** (not backed by RomM,
+  never worth syncing — they're regenerable, engine-only).
+- **A save folder's files are bundled into a single zip** (`src/simpleZip.ts`
+  — a minimal store-only zip reader/writer, no dependency, since this shim
+  only ever needs to read/write zips it created itself) and stored as one
+  RomM save. `manifest.server` lists each member as its own `{path, hash}`
+  entry (RetroArch diffs per-file), and `GET` unbundles the right member on
+  demand.
+- **Unlike every other save/state, PSP bundles don't preserve per-PUT
+  history.** PPSSPP writes a save folder as a burst of several individual
+  file PUTs a fraction of a second apart (verified live) — keeping every
+  intermediate partially-merged bundle as its own history entry would just
+  be noise, so the previous bundle row is deleted once the newly-merged one
+  is up. Only the final, fully-merged state after a save event is a
+  meaningful checkpoint.
+- **Matching a save folder to a RomM rom needs `PSP_SERIAL_MAP`.** RomM has
+  no PSP serial/product-code field to look this up automatically (checked
+  its API and rom schema — nothing there). Set
+  `PSP_SERIAL_MAP={"ULUS10336":"<rom title as it appears in RomM>"}` (the
+  serial is the save folder name minus its trailing `DATA<N>`, e.g.
+  `ULUS10336DATA0` → `ULUS10336`) for each PSP game you actually play. This
+  is only needed for the *first* sync of a given game — once a bundle
+  exists, later PUTs and all GETs find it by the save folder name alone
+  (already globally unique), no rom lookup involved.
+  - As a bonus, the shim also parses `PARAM.SFO`'s `TITLE` field
+    (`src/pspSfo.ts`, a minimal parser for the PSF/PARAM.SFO format) and
+    tries that as a fallback rom match when a serial isn't in the map yet.
+    This can work, but PSF titles are often formatted differently from
+    RomM's filename-derived titles (e.g. all-caps, `-FINAL FANTASY VII-`
+    instead of `: Final Fantasy VII`), so it's not reliable enough to
+    depend on — treat `PSP_SERIAL_MAP` as required, this as a maybe-helps
+    extra. If it does resolve a match, it's logged clearly so you can add
+    the mapping for reliability going forward.
+
 ## Configuring RetroArch
 
 Settings → Saving → Cloud Sync:

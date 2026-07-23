@@ -1,6 +1,7 @@
 import { getRomById, listSaves, listStates, type RommAsset } from "./rommClient.js";
 import { pickLatest, splitAssetFileName, stripShimStamp } from "./assetSync.js";
 import { toRetroArchDirName } from "./emulatorNames.js";
+import { buildPspManifestEntries, isPspBundleFileName } from "./pspSave.js";
 
 /**
  * RetroArch's cloud sync diffs against a JSON manifest of {path, hash}
@@ -22,7 +23,18 @@ import { toRetroArchDirName } from "./emulatorNames.js";
  * ever read, never mutated.
  */
 export async function buildServerManifest(): Promise<string> {
-  const [saves, states] = await Promise.all([listSaves(), listStates()]);
+  const [allSaves, states, pspEntries] = await Promise.all([
+    listSaves(),
+    listStates(),
+    buildPspManifestEntries(),
+  ]);
+
+  // PSP save bundles (see pspSave.ts) are a single zip asset representing
+  // several individual RetroArch-visible files — handled entirely by
+  // buildPspManifestEntries above, which lists each member separately.
+  // Excluded here so they don't ALSO get (mis)treated as a normal
+  // single-file save.
+  const saves = allSaves.filter((s) => !isPspBundleFileName(s.file_name));
 
   const romCache = new Map<number, string | null>();
   const romName = async (romId: number): Promise<string | null> => {
@@ -61,7 +73,7 @@ export async function buildServerManifest(): Promise<string> {
   const latestStatePerRomAndSlot = latestByKey(states, (s) => `${s.rom_id}:${stateSuffix(s)}`);
   const stateEntries = await buildEntries(latestStatePerRomAndSlot, "states", romName, stateSuffix);
 
-  return JSON.stringify([...saveEntries, ...stateEntries]);
+  return JSON.stringify([...saveEntries, ...stateEntries, ...pspEntries]);
 }
 
 function latestByKey(assets: RommAsset[], key: (a: RommAsset) => string): RommAsset[] {
