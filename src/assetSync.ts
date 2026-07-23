@@ -77,9 +77,9 @@ function resolveRomForFileName(fileName: string): Promise<RommRomMatch | null> {
 }
 
 /**
- * Finds whatever RomM currently considers "the" save/state for a rom, for
- * download — the most recently updated entry, regardless of who created it
- * or what it's named.
+ * Finds whatever RomM currently considers "the" save/state for a rom+slot,
+ * for download — the most recently updated entry for that specific slot,
+ * regardless of who created it or what it's named.
  *
  * This is what lets a library's pre-existing saves/states (created by
  * RomM's own native sync, a browser play session, manual uploads — not
@@ -89,6 +89,15 @@ function resolveRomForFileName(fileName: string): Promise<RommRomMatch | null> {
  * below always creates a fresh shim-managed row rather than overwriting
  * whatever this found — old entries are only ever read, never mutated or
  * deleted by this path.
+ *
+ * Scoped to `fileName`'s own slot via `assetHistoryKey` — states in
+ * particular can have several independent slots per rom (`.state`,
+ * `.state1`, `.state.auto`, ...), and this used to only filter by rom_id,
+ * ignoring slot entirely. Verified live this is a real bug, not
+ * theoretical: asking for one slot could silently serve back a *different*
+ * slot's content if that happened to be the rom's globally-newest state,
+ * because nothing here checked that the returned asset's own slot matched
+ * what was actually requested.
  */
 export async function findAssetForDownload(
   kind: AssetKind,
@@ -97,7 +106,9 @@ export async function findAssetForDownload(
   const rom = await resolveRomForFileName(fileName);
   if (!rom) return null;
 
-  const assets = (await listAssets(kind)).filter((a) => a.rom_id === rom.id);
+  const targetKey =
+    kind === "saves" ? String(rom.id) : `${rom.id}:${splitAssetFileName(fileName).suffix}`;
+  const assets = (await listAssets(kind)).filter((a) => assetHistoryKey(kind, a) === targetKey);
   if (assets.length === 0) return null;
   return pickLatest(assets);
 }
