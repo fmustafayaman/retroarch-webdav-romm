@@ -1,395 +1,136 @@
 # retroarch-webdav-romm
 
-A minimal WebDAV shim that lets RetroArch's built-in **Cloud Sync** feature
+A small server that lets RetroArch's built-in **Cloud Sync** feature
 (Settings → Saving → Cloud Sync) use a self-hosted [RomM](https://github.com/rommapp/romm)
-instance as its backing store for save files and save states. RomM stays the
-single source of truth for saves/states — nothing is stored on a separate
-WebDAV volume.
+instance to store your save files and save states. RomM is the only place
+data actually lives — this project doesn't store anything itself, it just
+translates between "what RetroArch expects from a WebDAV server" and "what
+RomM's API actually offers."
 
-It also exposes RomM's rom library as a real, browsable WebDAV directory
-tree under `/roms/`, so it can be mounted as a network drive from iOS
-Files (or any WebDAV client) to pull roms onto a device — see "Downloading
-roms" below. `/saves/` and `/states/` are browsable the same way, read-only,
-purely so you can see what's actually stored (including each individual
-member file of a PSP save bundle) from a WebDAV client — see "Browsing
-saves and states" below.
+It also lets you **browse and download roms, saves, and states** from any
+WebDAV client (like the Files app on iOS, or Finder on macOS), read-only.
 
-## Why not a full WebDAV server library
+## Quick start
 
-The project brief called for the `webdav-server` npm package (or `wsgidav`).
-After reading RetroArch's actual cloud-sync client source
-(`network/cloud_sync/webdav.c`, `tasks/task_cloudsync.c`), it turns out
-RetroArch **never sends `PROPFIND`** — it doesn't do directory listings at
-all. Instead it diffs a flat JSON manifest (`manifest.server`, an array of
-`{path, hash}` entries with MD5 hashes) that it fetches once per sync, and
-only ever issues `OPTIONS`, `GET`, `PUT`, `DELETE`, `MKCOL`, and `MOVE` for
-individual files. That's a much narrower surface than general-purpose WebDAV
-middleware is built for, so this shim is a small hand-rolled HTTP server
-(`src/webdavServer.ts`) instead — simpler to reason about than fighting a
-PROPFIND-XML-oriented library for verbs it doesn't even use.
+1. Deploy this alongside your RomM instance (see "Running" below).
+2. Fill in `.env` — you need your RomM URL + credentials, and you pick a
+   username/password for RetroArch to use.
+3. In RetroArch: Settings → Saving → Cloud Sync → point it at this server
+   (see "Setting up RetroArch" below).
+4. Hit "Sync Now" and check the logs if something looks off.
 
-The places real `PROPFIND` support was added are the `/roms/`, `/saves/`
-and `/states/` browsing trees (`src/webdavXml.ts` builds the
-`DAV:multistatus` XML) — that exists purely for generic WebDAV clients like
-iOS Files, not for RetroArch's Cloud Sync, which never sends `PROPFIND` at
-all.
+## How it works, in short
 
-## How it works
+RetroArch's Cloud Sync doesn't understand RomM at all — it only speaks
+WebDAV. This project sits in between:
 
-- `GET /manifest.server` — synthesized on every request from RomM's current
-  save/state listing (`saves/<file_name>`, `states/<file_name>` entries).
-  RomM is authoritative, so this can never drift out of sync with itself.
-  `PUT /manifest.server` (RetroArch writes one back after each sync) is
-  accepted and discarded — see `src/manifest.ts`.
-- `GET|PUT /saves/<filename>`, `GET|PUT /states/<filename>` — proxied to
-  RomM's `/api/saves` / `/api/states` endpoints. The target ROM is matched
-  by filename (RetroArch save filenames mirror the ROM filename), per
-  `src/assetSync.ts`.
-  - **RetroArch consistently nests saves/states under a per-core
-    subfolder** (verified live: `saves/Snes9x/Chrono Trigger (USA).srm`,
-    same for states) — this is RetroArch's real local directory layout,
-    not an edge case. The subfolder is captured on upload and stored on
-    RomM's `emulator` field, then used to reconstruct the *exact same*
-    subfolder path when building `manifest.server`. This round-trip
-    matters more than it looks: RetroArch's sync diffs against the
-    manifest by exact path string, so a manifest path missing the
-    subfolder RetroArch actually uses locally is treated as a completely
-    different, unrelated file — RetroArch would never recognize a match
-    and would re-upload the "missing" file (as a brand-new history entry,
-    given the point below) on every single sync, forever.
-  - **RomM's `emulator` field and RetroArch's local directory name are
-    two different strings for the same core**, not the same string in two
-    casings — e.g. RomM's convention is `snes9x`, RetroArch's own local
-    folder is `Snes9x`; for some cores they diverge further (RomM `mgba`
-    → RetroArch `mGBA`, RomM `mupen64plus_next` → RetroArch
-    `Mupen64Plus-Next`). Verified live that this is a real, not
-    theoretical, problem: naively round-tripping whatever string is
-    stored put a downloaded save in a `snes9x` folder RetroArch never
-    looks in — the save wasn't just misplaced, it was invisible to
-    RetroArch. Fixed with a translation table
-    (`src/emulatorNames.ts`, `toRommEmulator`/`toRetroArchDirName`) ported
-    from the community
-    [romm-retroarch-sync](https://github.com/Covin90/romm-retroarch-sync)
-    desktop app, which had already solved this exact problem — the
-    captured RetroArch folder name is normalized to RomM's convention
-    before upload, and translated back through the same table (with a
-    best-effort fallback for unmapped cores) when reconstructing the
-    manifest path. This works for *any* entry with the field set, not just
-    ones this shim uploaded, so it's correct from the very first sync —
-    no "wait for the shim's own upload to self-correct" caveat needed.
-  - **RetroArch's auto-savestate filename is `<game>.state.auto` — a
-    two-segment suffix, not a single extension.** Verified live: naive
-    last-dot splitting (`path.extname`) turns this into
-    base=`"<game>.state"`, suffix=`"auto"`, which fails rom lookup (no rom
-    is titled `"<game>.state"`) and, separately, would mis-reconstruct the
-    manifest path as `<game>.auto` instead of `<game>.state.auto` — RomM's
-    own `file_extension` field has the exact same problem, since RomM
-    derives it the same naive way. `splitAssetFileName` in
-    `src/assetSync.ts` special-cases this (matching the same fix in
-    romm-retroarch-sync); numbered slots (`.state1`–`.state9`) and save
-    extensions are single-segment and unaffected.
-  - **Every upload creates a new history entry — nothing is ever
-    overwritten in place.** `GET` always serves back whichever entry for
-    that rom/slot was updated most recently; a `PUT` never touches an
-    existing row, it always adds a new one. This means a library's
-    pre-existing saves/states (from RomM's own native sync, a browser play
-    session, a manual upload — anything, not just this shim) show up in
-    RetroArch automatically on first sync with no manual step, since
-    "most recently updated" naturally includes them — and it means
-    nothing this shim does can ever destroy an older save/state, since old
-    rows are only ever read, never mutated or replaced. See
-    `findAssetForDownload` / `putAssetContent` in `src/assetSync.ts`.
-  - **Getting real create-a-new-row semantics out of RomM took an extra
-    step.** Verified against a live instance: `POST /api/saves` and
-    `/api/states` both dedupe on `(rom_id, filename)` specifically — a
-    second upload with the same filename silently replaces the first
-    regardless of `slot` or the `overwrite` query flag. Since RetroArch
-    always sends the same filename for a given save/state slot, every
-    upload would otherwise collide. The fix: the shim stamps a timestamp
-    into the filename it sends to RomM (`withUniqueSuffix` in
-    `src/assetSync.ts`) — RetroArch never sees this name, since
-    `manifest.server` always reconstructs the plain expected filename from
-    the rom + the asset's own extension, not from whatever RomM stored it
-    as.
-  - **Saves are still matched by `(rom, slot)` for anything write-shaped**
-    (find-the-shim's-own-row-to `DELETE`), not by filename — on top of the
-    dedup issue above, `POST /api/saves` separately appends its own
-    `[<timestamp>]` suffix to the stored filename regardless of what's
-    sent, so a save could never be found again by name either way. The
-    shim tags every save it creates with a fixed `slot`
-    (`ROMM_SAVE_SLOT`, default `autosave` — not arbitrary: it's the same
-    slot name RomM's own reference clients report a game's primary save
-    under, per romm-retroarch-sync, so saves from this shim pair with
-    rather than fragment away from anything else in the setup using that
-    convention) and matches deletes on `(rom_id, slot)` instead. States
-    have no slot field in this RomM version, so a shim-owned state for
-    `DELETE` purposes is instead recognized by the `withUniqueSuffix`
-    naming pattern itself.
-  - **RomM's rom search (`search_term`) doesn't handle fully tagged
-    filenames.** Searching for `"Silent Hill (Europe) (En,Fr,De,Es,It)"`
-    verbatim returns zero results on a live instance, even though the rom
-    exists — it's a relevance search over the bare title, not a substring
-    match. The shim strips `(...)`/`[...]` tag groups before searching
-    (`stripTags` in `src/rommClient.ts`) and only relies on the exact
-    tagged filename for the final match against `fs_name_no_ext`/`fs_name`.
-- `PUT` failures (rom not found, RomM unreachable, ...) are logged as
-  errors on this end but **always answered with `204`, never an error
-  status**. This isn't leniency for its own sake — it's a crash
-  workaround. RetroArch's own `webdav.c` has a documented bug (its own
-  source comment, on `webdav_log_http_failure`): any non-2xx WebDAV
-  response gets logged through a path with a one-byte heap overflow (a
-  buffer gets NUL-terminated one byte past its allocated length), which
-  can corrupt the heap and crash RetroArch — the comment specifically
-  calls out "when cloud sync issues many requests in quick succession".
-  Reproduced live: a burst of PUTs that each genuinely failed with `502`
-  (PSP saves with no `PSP_SERIAL_MAP` entry yet — see below) crashed
-  RetroArch at the identical point on two separate sync attempts. Can't
-  fix RetroArch's C code from here, so the failure is kept from ever
-  reaching it as an HTTP error at all.
-- `DELETE` — best-effort. Failures are logged and still answered with `204`,
-  since RetroArch treats cloud sync deletes as fire-and-forget.
-- `MOVE` — RetroArch only issues this to back a file up under `deleted/...`
-  before a non-destructive delete. Treated as a delete of the source file.
-- Anything outside `saves/` and `states/` (i.e. `config/`, `thumbnails/`,
-  `system/`) — RomM has no generic blob store for these, so `PUT` is
-  accepted and silently discarded (logged as a warning) and `GET` 404s.
-  **Disable "Configuration", "Thumbnails", and "System Files" sync in
-  RetroArch's Cloud Sync settings** and leave only "Save Files & States" on
-  — see Known limitations below.
-- Auth: RetroArch (and Files/other WebDAV clients) authenticate to the shim
-  with HTTP Basic Auth (`WEBDAV_USERNAME`/`WEBDAV_PASSWORD`). The shim
-  authenticates to RomM with a single static RomM account, either a client
-  token (`ROMM_API_TOKEN`, sent as `Authorization: Bearer`) or
-  `ROMM_USERNAME`/`ROMM_PASSWORD` (sent as HTTP Basic) — RomM accepts both
-  directly on every endpoint used here, so there's no OAuth2 token/refresh
-  flow to manage for this single-user setup.
+```
+RetroArch  <-- WebDAV -->  this shim  <-- RomM's REST API -->  RomM
+```
 
-## PSP (PPSSPP) saves
+When RetroArch uploads a save, the shim figures out which RomM game it
+belongs to (by filename) and stores it there. When RetroArch asks what's
+changed, the shim builds the answer by asking RomM what it currently has —
+RomM's data is always the source of truth, nothing is cached to disk here.
 
-Unlike every other core, PPSSPP doesn't write a single save file per game —
-it mirrors a real PSP memory stick under RetroArch's own saves directory:
-`saves/<core>/PSP/SAVEDATA/<slot>/` holds several small files (PARAM.SFO,
-the actual save data, ICON0.PNG, PIC1.PNG, ...) that only make sense
-together, and `saves/<core>/PSP/SYSTEM/CACHE/` holds pure engine caches
-(shader caches etc., named by the game's serial, e.g.
-`ULUS10336.vkshadercache`) with no save data in them at all — verified
-live against real PPSSPP sync traffic. `src/pspSave.ts` handles this
-separately from every other save/state:
+A good chunk of this behavior only exists because RetroArch and RomM don't
+naturally agree with each other on file names, folder structure, or upload
+semantics — see **"Details worth knowing"** near the bottom if you're
+curious why, or if something isn't syncing the way you'd expect.
 
-- **SYSTEM/CACHE files are silently discarded** (not backed by RomM,
-  never worth syncing — they're regenerable, engine-only).
-- **A save folder's files are bundled into a single zip** (`src/simpleZip.ts`
-  — a minimal store-only zip reader/writer, no dependency, since this shim
-  only ever needs to read/write zips it created itself) and stored as one
-  RomM save. `manifest.server` lists each member as its own `{path, hash}`
-  entry (RetroArch diffs per-file), and `GET` unbundles the right member on
-  demand.
-- **Unlike every other save/state, PSP bundles don't preserve per-PUT
-  history.** PPSSPP writes a save folder as a burst of several individual
-  file PUTs a fraction of a second apart (verified live) — keeping every
-  intermediate partially-merged bundle as its own history entry would just
-  be noise, so the previous bundle row is deleted once the newly-merged one
-  is up. Only the final, fully-merged state after a save event is a
-  meaningful checkpoint.
-- **Files that arrive before the folder can be resolved to a rom are
-  buffered, not dropped.** Verified live that RetroArch doesn't guarantee
-  `PARAM.SFO` arrives first — a plain data file routinely gets processed
-  *before* it, and since a brand-new save folder can only be resolved to a
-  rom via `PARAM.SFO`'s title (or `PSP_SERIAL_MAP`), that file would
-  otherwise be silently lost, leaving a bundle with metadata/icon files
-  but no actual save data. Unresolved files are held in memory per save
-  folder (`pendingFiles` in `src/pspSave.ts`) and folded in once something
-  resolves the folder — usually `PARAM.SFO` itself arriving moments later
-  in the same sync. All PUTs for the same save folder are also serialized
-  (`withFolderLock`) so two files landing close together can't both miss
-  seeing each other's buffered state.
-- **Matching a save folder to a RomM rom is automatic** — no per-game setup
-  needed for the normal case. RomM has no PSP serial/product-code field to
-  look this up directly (checked its API and rom schema — nothing there),
-  but PPSSPP sends `PARAM.SFO` as part of every save, and its `TITLE`
-  field (parsed by `src/pspSfo.ts`, a minimal PSF-format parser) is matched
-  against RomM's rom titles after normalizing both down to bare
-  alphanumerics (`matchByNormalizedTitle` in `src/pspSave.ts`) — this is
-  what bridges PSF's stylized titles (e.g. `CRISIS CORE -FINAL FANTASY
-  VII-`, all-caps with a dash-wrapped subtitle) to RomM's filename-derived
-  ones (`Crisis Core - Final Fantasy VII (USA)`) without needing an exact
-  string match. This is only needed for the *first* sync of a given game —
-  once a bundle exists, later PUTs and all GETs find it by the save folder
-  name alone (already globally unique), no rom lookup involved.
-  - `PSP_SERIAL_MAP={"ULUS10336":"<rom title as it appears in RomM>"}`
-    (key = save folder name minus its trailing `DATA<N>`, e.g.
-    `ULUS10336DATA0` → `ULUS10336`) is an **optional override**, checked
-    first when present — only needed if a specific game's PSF title is
-    abbreviated/stylized enough that even normalized matching can't bridge
-    it (logged clearly when that happens, so you know which serial to add).
-
-## Configuring RetroArch
+## Setting up RetroArch
 
 Settings → Saving → Cloud Sync:
 
 | Setting | Value |
 |---|---|
 | Cloud Sync Driver | WebDAV |
-| Cloud Sync URL | `https://<your-shim-host>/` (must end in `/`) |
-| Cloud Sync Username | value of `WEBDAV_USERNAME` |
-| Cloud Sync Password | value of `WEBDAV_PASSWORD` |
+| Cloud Sync URL | `https://<your-server>/` (must end in `/`) |
+| Cloud Sync Username | your `WEBDAV_USERNAME` |
+| Cloud Sync Password | your `WEBDAV_PASSWORD` |
 | Sync Saves | On |
-| Sync Configuration | **Off** (see Known limitations) |
+| Sync Configuration | **Off** |
 | Sync Thumbnails | **Off** |
 | Sync System Files | **Off** |
 
-Then trigger a manual "Sync Now" and check the shim's logs
-(`LOG_LEVEL=debug`) if anything looks wrong — RetroArch's own error message
-is just "Cloud Sync failed" with no detail.
+Only "Sync Saves" is supported — RomM has nowhere to put config files,
+thumbnails, or system files, so leave those off. (If you leave them on
+anyway, nothing breaks — they're just silently ignored.)
+
+Trigger a manual **Sync Now** the first time and check the server logs
+(`LOG_LEVEL=debug`) if anything looks wrong. RetroArch's own error message
+is just "Cloud Sync failed," no detail.
+
+## PSP (PPSSPP) saves
+
+PPSSPP is the one core that doesn't save a single file per game — it
+writes several files per save slot (metadata, the actual save, icons),
+mimicking a real PSP memory stick. This is handled automatically: the
+first time a save shows up for a new game, its `PARAM.SFO` title is
+matched against your RomM library to figure out which game it belongs to.
+No manual setup needed for the normal case.
+
+If a specific game's title is too stylized for the automatic match to
+find it (logged clearly when that happens), you can add an explicit
+override in `.env`:
+
+```
+PSP_SERIAL_MAP={"ULUS10336":"Crisis Core - Final Fantasy VII (USA)"}
+```
+
+The key is the save's serial (the folder name minus its trailing
+`DATA<N>`), the value is the game's title exactly as it appears in RomM.
 
 ## Downloading roms
 
-RetroArch itself has no way to browse or pull content from an arbitrary
-custom server — its "Online Updater" / buildbot settings are for cores and
-UI assets (thumbnails, overlays, shaders, database files), not games, and
-there's no general "connect to a content server" feature. So getting roms
-onto a device is always a manual step of some kind — there's no automatic
-"RetroArch downloads what it's missing" flow to build on given RetroArch's
-actual capabilities.
+RetroArch has no built-in way to browse or download from a custom server —
+this isn't something the shim can add, since RetroArch's own file browser
+only looks at the local filesystem. So getting a rom onto your device is
+always a manual step, using one of:
 
-**On iOS, the simplest path is RomM's own web UI, not this shim.** RomM is
-a full web app — open `https://<your-romm-host>/` in Safari, log in with
-your RomM account, browse, and download. Safari's download manager handles
-large files (background downloads, resumable) without needing any extra
-app. Verified: **iOS's built-in Files app does not reliably support
-"Connect to Server" for arbitrary WebDAV servers** — it failed for a real
-deployment of the `/roms/` tree below even though the server side checked
-out correctly on every count (curl confirmed proper `207` PROPFIND
-responses, correct `text/xml` content type, working fake LOCK/UNLOCK
-handshake, and Cloudflare passing PROPFIND through untouched). Multiple
-unrelated projects' iOS users report the same "This URL is not supported"
-failure against their own WebDAV servers — it's an iOS Files limitation,
-not something fixable from the server side. A third-party WebDAV client
-app (e.g. "WebDAV Manager", or FileBrowser's Files-app integration) is the
-documented workaround if you want to use `/roms/` from iOS instead.
+- **RomM's own web UI** (open `https://<your-romm-host>/` in a browser,
+  log in, download) — simplest option, especially on iOS, where Safari's
+  download manager handles large files well.
+- **A WebDAV client** connected to this server, browsing into
+  `roms/<platform>/<game>`. Works well on macOS/Windows/Android. On iOS,
+  the built-in Files app's WebDAV support is unreliable for this — a
+  third-party client (Cyberduck, Transmit, FileBrowser, ...) works better.
 
-The `/roms/` tree (below) is still there and works — it's just a better
-fit for platforms with solid native WebDAV support (Windows, macOS,
-Android) than for iOS specifically:
-
-1. Connect to `https://<your-shim-host>/` with a WebDAV client, using
-   `WEBDAV_USERNAME`/`WEBDAV_PASSWORD` (same credentials as Cloud Sync
-   above).
-2. Browse into `roms/<platform>/`, find the game, download it.
-3. Move/copy the file into RetroArch's content directory so its own
-   content browser picks it up.
-
-See `src/romBrowser.ts` and the PROPFIND handling in `src/webdavServer.ts`.
-
-A few things verified against a live instance that shaped how `/roms/` is
-built:
-
-- **RomM zips multi-disc/multi-track roms on download** (with an `.m3u`
-  included) but serves single-file roms raw. The listing reflects this —
-  multi-file roms show up as `<name>.zip`, everything else keeps its real
-  extension. Getting the "is it really one file" signal right took two
-  tries: `has_simple_single_file: false` looked like the right check but
-  isn't — a rom stored as one file inside its own subfolder reports that
-  as `false` too (`has_nested_single_file: true`) while still downloading
-  raw, not zipped. Only `has_multiple_files: true` actually triggers
-  zipping. Get this wrong and the shim advertises a `.zip` that's actually
-  a raw `.chd` (or vice versa), which breaks the download in Files.
-- **The real filename for a single-nested-file rom isn't `fs_name`.**
-  `fs_name` for those turned out to be the *folder* name with no
-  extension (e.g. `"Alundra (USA) (v1.1)"`, not `"....chd"`) — the actual
-  filename is on `files[0].file_name`, which the roms list endpoint only
-  populates when the request includes `with_files=true` (confirmed by
-  testing with and without it; omitting it silently returns `files: []`
-  rather than an error, which is an easy way to end up serving
-  extensionless files without noticing).
-- **`search_term` doesn't handle fully tagged filenames** — same fix as
-  the saves matching above, since finding a rom by filename for saves
-  reuses this.
-- **Range requests only work for single-file roms.** RomM properly
-  supports `Range`/`206 Partial Content` on raw single-file downloads
-  (confirmed live), which the shim forwards through so Files can resume an
-  interrupted download. For zipped multi-file roms, RomM ignores the
-  `Range` header and streams the full file with `200 OK` regardless —
-  confirmed live on a ~793MB, 3-file rom. A dropped connection on a
-  multi-GB multi-disc game means starting over from zero; there's no fix
-  on this end since the zip is generated on the fly server-side.
-- **Rom sizes shown while browsing a multi-file rom's folder are
-  approximate.** RomM reports `fs_size_bytes` as the sum of the underlying
-  files, not the size of the zip it actually produces (compression +
-  `.m3u` overhead). Only affects what Files displays before downloading —
-  the actual transfer always uses the real `Content-Length` from RomM's
-  response, so nothing is truncated or misreported once the download
-  starts.
+Either way, once downloaded, move the file into RetroArch's own content
+folder so its game browser picks it up.
 
 ## Browsing saves and states
 
-`/saves/` and `/states/` support `PROPFIND` the same way `/roms/` does, so a
-WebDAV client (subject to the same iOS Files caveats as roms above) can
-browse exactly what's stored for each game — including, for PPSSPP, each
-individual file inside a save bundle (`PARAM.SFO`, the actual save data,
-`ICON0.PNG`, ...), not just the zip as one opaque blob. This is read-only
-browsing for humans; it has nothing to do with RetroArch's own sync, which
-never issues `PROPFIND` (see above).
+`roms/`, `saves/`, and `states/` are all browsable directory trees over
+WebDAV — connect with any WebDAV client and look around. This is purely
+for humans; RetroArch's own sync never lists directories, so nothing here
+affects how syncing works.
 
-The listing is derived from the exact same `{path, hash}` computation that
-builds `manifest.server` (`src/manifest.ts`'s `listSaveStateEntries`), so
-what you see in a WebDAV client always matches what RetroArch would sync —
-there's no separate, possibly-drifting source of truth for the two. The
-tree depth is dynamic rather than fixed like `/roms/`'s two levels
-(platform/file), since PSP paths go five levels deep
-(`saves/PPSSPP/PSP/SAVEDATA/<folder>/<file>`) while every other save/state
-is one or two levels; `src/webdavServer.ts`'s `saveStateListing` walks the
-flat path list to reconstruct whatever depth is actually there.
+What you see always matches what RetroArch would sync, because it's built
+from the same data. For PPSSPP saves, you'll see each individual file
+inside a save bundle rather than one opaque zip.
 
-- **Browsing felt slow before RomM listing calls were cached — verified
-  live.** Request logs from a real Files app browse showed `/api/platforms`,
-  `/api/roms`, `/api/saves`, `/api/states` being re-fetched from RomM on
-  nearly every single PROPFIND, including literally millisecond-identical
-  concurrent duplicates — because a WebDAV browse isn't just the folders
-  you actually open: Files/Finder fire an invisible `PROPFIND` for a
-  `._<name>` AppleDouble companion file per entry too (harmless — always
-  404s, never touches RomM or creates anything — but it's still a request).
-  `src/rommClient.ts` now caches these listing calls in memory for
-  `CACHE_TTL_SECONDS` (default 30s) with in-flight deduplication, and
-  invalidates immediately on this shim's own writes. After that fix, the
-  same browse showed each listing endpoint hit once, not dozens of times.
-- **What's left after caching is client-side, not server-side.** iOS
-  Files' WebDAV client sends its `._name` probes and real listing requests
-  one at a time, sequentially, waiting for each response — for a library
-  of hundreds of roms this adds up to real wall-clock time purely from
-  network round-trips, even though every individual response is now a fast
-  in-memory cache hit. Not fixable from the server; a non-Apple WebDAV
-  client (Cyberduck, Transmit, ForkLift, ...) skips the AppleDouble probing
-  entirely and browses noticeably faster.
-- **RetroArch's own in-app file browser can't reach this at all** —
-  confirmed live: it's a simple local-filesystem browser with no
-  OS-document-picker or network-location integration, so there's no way to
-  point RetroArch's own "Load Content" at `/roms/` directly, on iOS or
-  otherwise. Downloading still has to go through a separate WebDAV client
-  or RomM's own web UI, then a manual move into RetroArch's content
-  directory — see "Downloading roms" above.
+**A note on speed:** browsing can feel slow on iOS specifically, because
+Apple's Files app quietly checks for a hidden companion file for every
+single item it lists, one at a time. This is harmless (nothing is created
+or touched) but adds up over a large library. It's a Files app quirk, not
+something the server does — a non-Apple WebDAV client skips this and
+browses noticeably faster.
 
-## Configuration (env vars)
+## Configuration
 
-See `.env.example`. All required, no hardcoded secrets in code:
+See `.env.example` for the full list with comments. The essentials:
 
-- `ROMM_BASE_URL` — the RomM instance. Plus either `ROMM_API_TOKEN` or
-  `ROMM_USERNAME`/`ROMM_PASSWORD` — the RomM account whose saves/states/roms
-  are exposed.
-- `ROMM_SAVE_SLOT` — fixed slot tag the shim uses for saves it creates
-  (default `autosave`, matching RomM's own reference clients — see above).
-  Only change this if running more than one instance of this shim against
-  the same RomM account.
-- `WEBDAV_USERNAME`, `WEBDAV_PASSWORD` — credentials RetroArch authenticates
-  with against this shim.
-- `PORT`, `BIND_ADDRESS` — shim's own listen socket (defaults `8080` /
-  `0.0.0.0`).
-- `LOG_LEVEL` — `trace|debug|info|warn|error`. `debug` logs every WebDAV
-  request (verb + path) and the RomM API call it triggered.
-- `CACHE_TTL_SECONDS` — how long RomM listing calls (platforms, roms,
-  saves, states, rom-by-id) are cached in memory (default `30`, `0`
-  disables caching). See "Browsing saves and states" below for why this
-  matters in practice.
+| Variable | Meaning |
+|---|---|
+| `ROMM_BASE_URL` | Your RomM instance's URL |
+| `ROMM_API_TOKEN` **or** `ROMM_USERNAME`/`ROMM_PASSWORD` | RomM account this shim acts as |
+| `WEBDAV_USERNAME` / `WEBDAV_PASSWORD` | Credentials RetroArch (and any WebDAV client) authenticates with |
+| `ROMM_SAVE_SLOT` | Save slot tag, default `autosave` — leave as-is unless running multiple instances against the same RomM account |
+| `PSP_SERIAL_MAP` | Optional PSP title overrides — see above |
+| `PORT`, `BIND_ADDRESS` | Where the server listens (default `8080`, `0.0.0.0`) |
+| `LOG_LEVEL` | `trace\|debug\|info\|warn\|error` |
+| `CACHE_TTL_SECONDS` | How long RomM listing results are cached in memory (default `30`, `0` disables) — keeps browsing fast without hammering RomM |
 
 ## Running
 
@@ -405,54 +146,131 @@ docker run --env-file .env -p 8080:8080 retroarch-webdav-romm
 ```
 
 `docker-compose.yml` is set up to deploy on Dokploy or Coolify alongside an
-existing RomM instance/stack — set the env vars in the platform UI (or a
-mounted `.env`), and optionally join RomM's Compose network instead of
-publishing the port directly if the platform's reverse proxy will route to
-it internally.
+existing RomM stack — set the env vars in the platform's UI (or a mounted
+`.env`), and optionally join RomM's Compose network instead of publishing
+the port directly if the platform's reverse proxy will route to it
+internally.
 
 ## Known limitations
 
-- **Config/thumbnails/system sync is out of scope.** RomM has no generic
-  file store for these, so leave those RetroArch cloud-sync categories off.
-  Turning them on won't break anything (writes are silently discarded,
-  reads 404 which RetroArch treats as "not present yet"), it'll just do
-  pointless work every sync.
-- **Save states are core/version-specific.** If you sync a save state made
-  with core version A and load it with core version B, RetroArch/the core
-  may reject it. That's a RetroArch/libretro-core limitation, not something
-  this shim can fix.
-- **No real conflict detection** — the newest `updated_at` always wins on
-  read, full stop. If a save is modified from two devices between syncs,
-  whichever one uploaded most recently is what every device sees next; the
-  other device's change isn't lost (its row is kept, per the history
-  behavior above) but it's also not surfaced as a conflict anywhere. A
-  real fix would mean actual divergence detection, which is out of scope
-  for v1 — see the brief's "don't try to be clever" guidance.
-- **History grows forever, there's no pruning.** Every save/state upload
-  is a new row (see above) and nothing here ever deletes old ones
-  automatically — `DELETE` only removes the single most recent
-  shim-created entry, on RetroArch's own request. Over months of regular
-  play this can accumulate a lot of rows per rom. RomM's own UI/API
-  (`autocleanup`/`autocleanup_limit` on saves, or manual deletion) is the
-  place to prune, not something this shim does on your behalf.
-- **Filename-only ROM matching.** The rom to sync against is still resolved
-  from the filename alone (the core subfolder round-trips into RomM's
-  `emulator` field for path reconstruction, but isn't used to disambiguate
-  *which rom*) — two different cores producing a same-named save file for
-  two different ROMs will collide in RomM's per-user save list. Fine for a
-  single-user/family library where filenames are already unique.
-- **The `emulator`→directory-name table (`src/emulatorNames.ts`) is a
-  fixed list of known libretro cores**, ported from romm-retroarch-sync.
-  An entry with `emulator` set to something not in the table falls back
-  to a best-effort transform (title-case, `beetle_`/`mednafen_` →
-  `"Beetle "`, underscores → spaces) rather than a guaranteed-correct
-  name — fine for common cores, may need a table entry added for an
-  obscure one. An entry with no `emulator` at all still falls back to a
-  flat path with no subfolder, same as before.
-- **`content_hash` fallback.** RomM's save/state rows may have a null
-  `content_hash` (e.g. rows that predate hashing support). The shim falls
-  back to a `size-updated_at` fingerprint for the manifest in that case,
-  which can't detect a same-size edit inside the same second — it'll just
-  cause one extra redundant verification pass on that file, not data loss.
-- **Single-user only.** One static RomM account and one static WebDAV
-  credential pair, by design — see the project brief's non-goals.
+- **One RomM account, one WebDAV login.** This is a single-user tool by
+  design, not a multi-tenant server.
+- **No real conflict resolution.** If you save from two devices between
+  syncs, whichever upload happened most recently is what every device
+  sees next. The other save isn't deleted, just not surfaced as a
+  conflict — RomM keeps every upload as history.
+- **History isn't pruned automatically.** Every save/state upload adds a
+  new row in RomM rather than replacing the old one. Over months of play
+  this adds up — use RomM's own cleanup tools (or manual deletion) to
+  prune old saves, this shim won't do it for you.
+- **Games are matched by filename.** Two different games that happen to
+  produce a save with the same filename would collide. Not an issue for a
+  normal personal library where filenames are already unique.
+- **Save states are core/version-specific**, same as vanilla RetroArch —
+  loading a state made with a different core version can fail. Nothing to
+  do with this shim.
+
+## Details worth knowing
+
+<details>
+<summary>Why not a real WebDAV server library</summary>
+
+The obvious choice would've been an existing `webdav-server` package. But
+after reading RetroArch's actual sync code
+(`network/cloud_sync/webdav.c`), it turns out RetroArch **never sends
+`PROPFIND`** for syncing — it just diffs a flat JSON file list
+(`manifest.server`) and issues plain `GET`/`PUT`/`DELETE`/`MOVE` per file.
+That's a narrow enough surface that a small hand-rolled server
+(`src/webdavServer.ts`) was simpler than fighting a general-purpose
+library built for a much bigger protocol. `PROPFIND` (directory listing)
+*was* added, but only for the human-browsing feature — RetroArch's own
+sync never touches it.
+
+</details>
+
+<details>
+<summary>How saves/states actually map onto RomM's API</summary>
+
+- **RetroArch nests saves/states in a per-core subfolder**
+  (`saves/Snes9x/Chrono Trigger.srm`), and this has to round-trip through
+  RomM's `emulator` field correctly, or RetroArch treats every synced file
+  as "still missing" and re-uploads it forever. RomM's own naming
+  convention for that field (`snes9x`) isn't the same string as
+  RetroArch's folder name (`Snes9x`) — sometimes wildly different
+  (`mupen64plus_next` vs `Mupen64Plus-Next`) — so there's a translation
+  table (`src/emulatorNames.ts`, ported from the community
+  [romm-retroarch-sync](https://github.com/Covin90/romm-retroarch-sync)
+  project).
+- **RetroArch's auto-savestate file is named `<game>.state.auto`** — a
+  two-part suffix that naive extension-splitting mishandles (splits into
+  `.state` + `auto`, which then fails to match anything). Handled as a
+  special case.
+- **Every upload becomes a new row in RomM, never overwriting the last
+  one.** This means older saves are never lost, and it's also *why* a
+  library's pre-existing saves/states (from RomM's browser player, manual
+  uploads, whatever) automatically show up in RetroArch the first time you
+  sync — reads just look for whatever's newest, regardless of who created
+  it.
+- **RomM silently overwrites an upload with the same filename**, which
+  would otherwise break the "keep every upload as history" behavior above
+  — RetroArch always uploads the same filename for a given save slot. The
+  fix is a timestamp stamped into the filename actually sent to RomM;
+  RetroArch never sees this, since the shim always reconstructs the plain
+  filename it expects.
+- **RomM's rom search doesn't handle fully tagged filenames** like
+  `Silent Hill (Europe) (En,Fr,De,Es,It)` — it's relevance search over the
+  bare title, not substring matching. Tags are stripped before searching,
+  then the exact tagged filename is used for the final match.
+
+</details>
+
+<details>
+<summary>Why PUT failures always return 204, never an error</summary>
+
+RetroArch's own WebDAV client has a real bug: any non-2xx response runs
+through a code path with a one-byte heap buffer overflow (RetroArch's own
+source comment describes it), which can corrupt the heap and crash the app
+— worse under a burst of failing requests in a row. This was reproduced
+live: a run of genuinely-failing uploads crashed RetroArch at the same
+point, twice. Since that can't be fixed from this end, failures are logged
+here but the response sent back to RetroArch is always `204`, so it never
+sees an error status that could trigger the bug.
+
+</details>
+
+<details>
+<summary>PSP save bundling details</summary>
+
+PPSSPP writes several files per save slot (metadata, save data, icons) as
+separate WebDAV uploads a fraction of a second apart. These get bundled
+into a single zip stored as one RomM save, and unbundled again on
+download/browsing. A few things that had to be handled carefully:
+
+- Files can arrive in any order, and only `PARAM.SFO`'s title lets a new
+  save folder be matched to a game — so anything that arrives first is
+  buffered in memory rather than dropped, and merged in once the match is
+  found.
+- Unlike normal saves/states, each save event replaces the previous PSP
+  bundle rather than keeping every intermediate state as history — the
+  in-between states (mid-merge) aren't meaningful checkpoints on their
+  own.
+- RomM has no PSP serial field, so games are matched by comparing
+  `PARAM.SFO`'s title against RomM's titles after normalizing away
+  punctuation/casing differences.
+
+</details>
+
+<details>
+<summary>Why RomM listing calls are cached</summary>
+
+Browsing with a WebDAV client fires far more requests than it looks like —
+Files/Finder send an invisible extra request per item (checking for a
+metadata companion file), on top of the real listing requests. Verified
+live: before caching, this meant RomM's platform/rom/save/state lists were
+being re-fetched from scratch dozens of times during a single browse,
+including literal duplicate requests fired milliseconds apart. Listing
+calls are now cached in memory for `CACHE_TTL_SECONDS` (default 30s), and
+invalidated immediately whenever this shim uploads or deletes something
+itself, so its own writes are always visible right away.
+
+</details>
