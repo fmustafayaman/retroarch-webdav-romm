@@ -187,24 +187,25 @@ separately from every other save/state:
   be noise, so the previous bundle row is deleted once the newly-merged one
   is up. Only the final, fully-merged state after a save event is a
   meaningful checkpoint.
-- **Matching a save folder to a RomM rom needs `PSP_SERIAL_MAP`.** RomM has
-  no PSP serial/product-code field to look this up automatically (checked
-  its API and rom schema — nothing there). Set
-  `PSP_SERIAL_MAP={"ULUS10336":"<rom title as it appears in RomM>"}` (the
-  serial is the save folder name minus its trailing `DATA<N>`, e.g.
-  `ULUS10336DATA0` → `ULUS10336`) for each PSP game you actually play. This
-  is only needed for the *first* sync of a given game — once a bundle
-  exists, later PUTs and all GETs find it by the save folder name alone
-  (already globally unique), no rom lookup involved.
-  - As a bonus, the shim also parses `PARAM.SFO`'s `TITLE` field
-    (`src/pspSfo.ts`, a minimal parser for the PSF/PARAM.SFO format) and
-    tries that as a fallback rom match when a serial isn't in the map yet.
-    This can work, but PSF titles are often formatted differently from
-    RomM's filename-derived titles (e.g. all-caps, `-FINAL FANTASY VII-`
-    instead of `: Final Fantasy VII`), so it's not reliable enough to
-    depend on — treat `PSP_SERIAL_MAP` as required, this as a maybe-helps
-    extra. If it does resolve a match, it's logged clearly so you can add
-    the mapping for reliability going forward.
+- **Matching a save folder to a RomM rom is automatic** — no per-game setup
+  needed for the normal case. RomM has no PSP serial/product-code field to
+  look this up directly (checked its API and rom schema — nothing there),
+  but PPSSPP sends `PARAM.SFO` as part of every save, and its `TITLE`
+  field (parsed by `src/pspSfo.ts`, a minimal PSF-format parser) is matched
+  against RomM's rom titles after normalizing both down to bare
+  alphanumerics (`matchByNormalizedTitle` in `src/pspSave.ts`) — this is
+  what bridges PSF's stylized titles (e.g. `CRISIS CORE -FINAL FANTASY
+  VII-`, all-caps with a dash-wrapped subtitle) to RomM's filename-derived
+  ones (`Crisis Core - Final Fantasy VII (USA)`) without needing an exact
+  string match. This is only needed for the *first* sync of a given game —
+  once a bundle exists, later PUTs and all GETs find it by the save folder
+  name alone (already globally unique), no rom lookup involved.
+  - `PSP_SERIAL_MAP={"ULUS10336":"<rom title as it appears in RomM>"}`
+    (key = save folder name minus its trailing `DATA<N>`, e.g.
+    `ULUS10336DATA0` → `ULUS10336`) is an **optional override**, checked
+    first when present — only needed if a specific game's PSF title is
+    abbreviated/stylized enough that even normalized matching can't bridge
+    it (logged clearly when that happens, so you know which serial to add).
 
 ## Configuring RetroArch
 

@@ -10,7 +10,9 @@ import {
   uploadNewSave,
   deleteSaves,
   findRomByBaseName,
+  searchRoms,
   type RommAsset,
+  type RommRomMatch,
 } from "./rommClient.js";
 
 /**
@@ -111,6 +113,47 @@ function deriveSerial(saveFolder: string): string {
   return saveFolder.replace(/DATA\d+$/i, "");
 }
 
+/**
+ * Loose title comparison for matching a PARAM.SFO TITLE (e.g.
+ * "CRISIS CORE -FINAL FANTASY VII-") against RomM's filename-derived
+ * titles (e.g. "Crisis Core - Final Fantasy VII (USA)") — collapses both
+ * down to bare alphanumerics so punctuation/casing/spacing differences
+ * (which are the norm between PSF titles and filename-derived ones, not
+ * the exception) don't block an otherwise-obvious match. This is
+ * deliberately looser than `findRomByBaseName`'s exact match used
+ * everywhere else: that precision matters when matching a save/state to
+ * *the* rom among near-identical filenames (tags, regions, revisions),
+ * but a PSP serial only ever maps to one specific rom in the first place,
+ * so a confident normalized match here isn't gambling on the wrong game.
+ */
+function normalizeTitle(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+async function matchByNormalizedTitle(title: string): Promise<RommRomMatch | null> {
+  const candidates = await searchRoms(title);
+  const target = normalizeTitle(title);
+  return (
+    candidates.find((r) => normalizeTitle(r.fs_name_no_tags) === target) ??
+    candidates.find((r) => normalizeTitle(r.name) === target) ??
+    candidates.find((r) => normalizeTitle(r.fs_name_no_ext) === target) ??
+    null
+  );
+}
+
+/**
+ * Resolves a PSP save folder to a RomM rom. Tries the PARAM.SFO title
+ * first — it's already sent as part of every save, so this is what makes
+ * PSP saves sync automatically with zero manual setup for the common
+ * case. `PSP_SERIAL_MAP` (config.ts) is an explicit override checked
+ * first when present, and the fallback when SFO title matching doesn't
+ * find anything — some games' PSF titles are abbreviated/stylized enough
+ * (all-caps, subtitle-only, ...) that normalization alone won't bridge
+ * the gap to RomM's filename-derived title.
+ */
 async function resolveRomId(saveFolder: string, sfoTitle: string | null): Promise<number | null> {
   const serial = deriveSerial(saveFolder);
   const mappedTitle = config.pspSerialMap[serial];
@@ -124,14 +167,18 @@ async function resolveRomId(saveFolder: string, sfoTitle: string | null): Promis
   }
 
   if (sfoTitle) {
-    const rom = await findRomByBaseName(sfoTitle);
+    const rom = await matchByNormalizedTitle(sfoTitle);
     if (rom) {
       logger.info(
         { serial, sfoTitle, matchedRom: rom.fs_name },
-        `resolved PSP save via PARAM.SFO title — for reliability, add "${serial}": "${rom.fs_name_no_ext}" to PSP_SERIAL_MAP`,
+        "resolved PSP save via PARAM.SFO title automatically",
       );
       return rom.id;
     }
+    logger.warn(
+      { serial, sfoTitle },
+      `couldn't auto-match PARAM.SFO title to a RomM rom — add "${serial}" to PSP_SERIAL_MAP if this keeps happening`,
+    );
   }
 
   return null;

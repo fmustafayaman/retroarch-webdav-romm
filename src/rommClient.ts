@@ -17,6 +17,8 @@ export interface RommRomMatch {
   id: number;
   fs_name: string;
   fs_name_no_ext: string;
+  fs_name_no_tags: string;
+  name: string;
 }
 
 export interface RommPlatform {
@@ -90,17 +92,22 @@ function stripTags(name: string): string {
   return name.replace(/[([][^)\]]*[)\]]/g, "").trim();
 }
 
-/** Finds a rom whose on-disk filename (without extension) matches `baseName`. */
-export async function findRomByBaseName(baseName: string): Promise<RommRomMatch | null> {
+/** Raw search candidates, tag-stripped query — used where the caller needs to apply its own match logic (e.g. pspSave.ts's fuzzier title matching). */
+export async function searchRoms(term: string): Promise<RommRomMatch[]> {
   const qs = new URLSearchParams({
-    search_term: stripTags(baseName) || baseName,
+    search_term: stripTags(term) || term,
     limit: "25",
     with_char_index: "false",
     with_filter_values: "false",
   });
   const res = await rommFetchOk(`/api/roms?${qs}`);
   const data = (await res.json()) as { items: RommRomMatch[] };
-  const items = data.items ?? [];
+  return data.items ?? [];
+}
+
+/** Finds a rom whose on-disk filename (without extension) matches `baseName`. */
+export async function findRomByBaseName(baseName: string): Promise<RommRomMatch | null> {
+  const items = await searchRoms(baseName);
   const lower = baseName.toLowerCase();
   return (
     items.find((r) => r.fs_name_no_ext.toLowerCase() === lower) ??
