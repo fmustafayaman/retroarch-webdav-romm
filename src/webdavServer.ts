@@ -516,9 +516,28 @@ async function handleMove(reqPath: string, req: IncomingMessage, res: ServerResp
 }
 
 export function createServer() {
-  return http.createServer(async (req, res) => {
+  const server = http.createServer(async (req, res) => {
     const method = req.method ?? "GET";
-    const reqPath = requestPath(req);
+    let reqPath: string;
+
+    // requestPath() decodes a percent-encoded URL and can throw (e.g.
+    // URIError on a malformed escape sequence) — this used to happen
+    // *before* both the debug log below and the try/catch further down,
+    // so a request that failed to parse vanished with zero trace: no log
+    // line at all, no response ever sent back, the connection just hangs
+    // until RetroArch's own timeout. Verified live this isn't
+    // hypothetical — a specific save/state upload was silently and
+    // consistently dropped this way across many sync attempts with
+    // nothing in the logs to show it had ever arrived. Wrapping this
+    // guarantees every request gets logged and answered, even a
+    // malformed one.
+    try {
+      reqPath = requestPath(req);
+    } catch (err) {
+      logger.error({ err, method, url: req.url }, "failed to parse request path");
+      res.writeHead(400).end();
+      return;
+    }
 
     logger.debug({ method, path: reqPath }, "webdav request");
 
@@ -559,4 +578,16 @@ export function createServer() {
       else res.end();
     }
   });
+
+  // A raw HTTP parse failure (malformed request line/headers, before Node
+  // ever builds a usable `req` to hand to the listener above) is a second,
+  // lower-level way a request can vanish with nothing in the logs — Node's
+  // default behavior is to just destroy the socket. Log it and answer with
+  // a real 400 instead of a silent connection drop.
+  server.on("clientError", (err, socket) => {
+    logger.error({ err }, "client HTTP parse error");
+    if (!socket.destroyed) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+  });
+
+  return server;
 }
