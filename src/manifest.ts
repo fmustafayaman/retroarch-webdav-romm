@@ -1,7 +1,8 @@
-import { getRomById, listSaves, listStates, type RommAsset } from "./rommClient.js";
+import { getRomById, listSaves, listStates, type RommAsset, type RommRomMatch } from "./rommClient.js";
 import { assetHistoryKey, sortByRecency, splitAssetFileName, stripShimStamp } from "./assetSync.js";
-import { toRetroArchDirName } from "./emulatorNames.js";
+import { defaultCoreForPlatform, toRetroArchDirName } from "./emulatorNames.js";
 import { buildPspManifestEntries, isPspBundleFileName } from "./pspSave.js";
+import { config } from "./config.js";
 
 export interface ManifestEntry {
   path: string;
@@ -43,13 +44,13 @@ export async function listSaveStateEntries(): Promise<ManifestEntry[]> {
   ]);
 
   const saves = allSaves.filter((s) => !isPspBundleFileName(s.file_name));
-  const romName = makeRomNameResolver();
+  const romResolver = makeRomResolver();
 
   const latestSavePerRom = latestByKey(saves, saveKey);
-  const saveEntries = await buildEntries(latestSavePerRom, "saves", romName, saveSuffix);
+  const saveEntries = await buildEntries(latestSavePerRom, "saves", romResolver, saveSuffix);
 
   const latestStatePerRomAndSlot = latestByKey(states, stateKey);
-  const stateEntries = await buildEntries(latestStatePerRomAndSlot, "states", romName, stateSuffix);
+  const stateEntries = await buildEntries(latestStatePerRomAndSlot, "states", romResolver, stateSuffix);
 
   return [...saveEntries, ...stateEntries, ...pspEntries];
 }
@@ -78,10 +79,10 @@ export async function listSaveStateHistoryEntries(): Promise<ManifestEntry[]> {
   ]);
 
   const saves = allSaves.filter((s) => !isPspBundleFileName(s.file_name));
-  const romName = makeRomNameResolver();
+  const romResolver = makeRomResolver();
 
-  const saveEntries = await buildHistoryEntries(saves, "saves", romName, saveKey, saveSuffix);
-  const stateEntries = await buildHistoryEntries(states, "states", romName, stateKey, stateSuffix);
+  const saveEntries = await buildHistoryEntries(saves, "saves", romResolver, saveKey, saveSuffix);
+  const stateEntries = await buildHistoryEntries(states, "states", romResolver, stateKey, stateSuffix);
 
   return [...saveEntries, ...stateEntries, ...pspEntries];
 }
@@ -118,12 +119,11 @@ const saveSuffix = (a: RommAsset) => a.file_extension;
 const stateSuffix = (a: RommAsset) => splitAssetFileName(stripShimStamp(a.file_name)).suffix;
 const stateKey = (a: RommAsset) => assetHistoryKey("states", a);
 
-function makeRomNameResolver(): (romId: number) => Promise<string | null> {
-  const cache = new Map<number, string | null>();
+function makeRomResolver(): (romId: number) => Promise<RommRomMatch | null> {
+  const cache = new Map<number, RommRomMatch | null>();
   return async (romId: number) => {
     if (!cache.has(romId)) {
-      const rom = await getRomById(romId);
-      cache.set(romId, rom?.fs_name_no_ext ?? null);
+      cache.set(romId, await getRomById(romId));
     }
     return cache.get(romId) ?? null;
   };
@@ -147,14 +147,14 @@ function groupByKey(assets: RommAsset[], key: (a: RommAsset) => string): Map<str
 async function buildEntries(
   assets: RommAsset[],
   prefix: "saves" | "states",
-  romName: (romId: number) => Promise<string | null>,
+  romResolver: (romId: number) => Promise<RommRomMatch | null>,
   suffixOf: (asset: RommAsset) => string,
 ): Promise<ManifestEntry[]> {
   const entries = await Promise.all(
     assets.map(async (a) => {
-      const base = await romName(a.rom_id);
-      if (!base) return null;
-      return toEntry(`${dirFor(prefix, a)}/${base}.${suffixOf(a)}`, a);
+      const rom = await romResolver(a.rom_id);
+      if (!rom) return null;
+      return toEntry(`${dirFor(prefix, a, rom)}/${rom.fs_name_no_ext}.${suffixOf(a)}`, a);
     }),
   );
   return entries.filter((e): e is ManifestEntry => e !== null);
@@ -163,7 +163,7 @@ async function buildEntries(
 async function buildHistoryEntries(
   assets: RommAsset[],
   prefix: "saves" | "states",
-  romName: (romId: number) => Promise<string | null>,
+  romResolver: (romId: number) => Promise<RommRomMatch | null>,
   keyOf: (asset: RommAsset) => string,
   suffixOf: (asset: RommAsset) => string,
 ): Promise<ManifestEntry[]> {
@@ -172,13 +172,16 @@ async function buildHistoryEntries(
 
   for (const group of groups.values()) {
     const sorted = sortByRecency(group);
-    const base = await romName(sorted[0]!.rom_id);
-    if (!base) continue;
+    const rom = await romResolver(sorted[0]!.rom_id);
+    if (!rom) continue;
 
     sorted.forEach((a, i) => {
       const suffix = suffixOf(a);
-      const name = i === 0 ? `${base}.${suffix}` : `${base} [${historyLabel(a)}].${suffix}`;
-      entries.push(toEntry(`${dirFor(prefix, a)}/${name}`, a));
+      const name =
+        i === 0
+          ? `${rom.fs_name_no_ext}.${suffix}`
+          : `${rom.fs_name_no_ext} [${historyLabel(a)}].${suffix}`;
+      entries.push(toEntry(`${dirFor(prefix, a, rom)}/${name}`, a));
     });
   }
 
@@ -206,8 +209,18 @@ function historyLabel(a: RommAsset): string {
 // into a folder RetroArch never looks in — translating through RomM's own
 // convention rather than round-tripping raw strings fixes it for any
 // entry, not just ones this shim uploaded.
-function dirFor(prefix: "saves" | "states", asset: RommAsset): string {
-  return asset.emulator ? `${prefix}/${toRetroArchDirName(asset.emulator)}` : prefix;
+//
+// When `emulator` is entirely unset — verified live that RomM's own
+// browser player (EmulatorJS) never sets it — fall back to a guessed
+// default core for the rom's platform (`defaultCoreForPlatform`) instead
+// of a flat, no-subfolder path. Without this, a save made by playing a
+// game in RomM's web UI sits at a path RetroArch's local sync never
+// recognizes as "the same file" as its own nested one, so it's invisible
+// to RetroArch even though it's right there in RomM.
+function dirFor(prefix: "saves" | "states", asset: RommAsset, rom: RommRomMatch): string {
+  if (asset.emulator) return `${prefix}/${toRetroArchDirName(asset.emulator)}`;
+  const guessedCore = defaultCoreForPlatform(rom.platform_fs_slug, config.defaultCoreByPlatform);
+  return guessedCore ? `${prefix}/${guessedCore}` : prefix;
 }
 
 function toEntry(path: string, asset: RommAsset): ManifestEntry {

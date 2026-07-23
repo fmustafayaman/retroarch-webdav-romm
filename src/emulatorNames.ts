@@ -73,6 +73,57 @@ const RETROARCH_DIR_BY_ROMM_EMULATOR: Record<string, string> = {
   citra: "Citra",
 };
 
+/**
+ * RomM platform slug -> a default RetroArch core folder, used only when a
+ * save/state has no `emulator` field at all (verified live: RomM's own
+ * browser player, EmulatorJS, never sets it — so a save made by playing a
+ * game in RomM's web UI has nowhere to go but this shim's flat fallback
+ * otherwise, landing at a path RetroArch's local sync never recognizes as
+ * "the same file"). Slugs verified against RomM's own source
+ * (`backend/handler/metadata/base_handler.py`'s `UniversalPlatformSlug`
+ * enum) rather than guessed. Picking the actual core a specific user plays
+ * a platform with is inherently a guess when RomM gives no signal at all —
+ * these are just the most common choice per platform; override any of them
+ * (or add platforms not listed here) via `DEFAULT_CORE_BY_PLATFORM` in
+ * .env.
+ */
+const DEFAULT_CORE_BY_PLATFORM: Record<string, string> = {
+  snes: "Snes9x",
+  nes: "Nestopia",
+  gb: "Gambatte",
+  gbc: "Gambatte",
+  gba: "mGBA",
+  genesis: "Genesis Plus GX",
+  n64: "Mupen64Plus-Next",
+  saturn: "Beetle Saturn",
+  psx: "Beetle PSX HW",
+  ps2: "PCSX2",
+  ngc: "Dolphin",
+  dc: "Flycast",
+  atari2600: "Stella",
+  tg16: "Beetle PCE",
+  dos: "DOSBox-Pure",
+  psp: "PPSSPP",
+  nds: "melonDS",
+  n3ds: "Citra",
+  arcade: "MAME",
+};
+
+/**
+ * Best-effort default RetroArch core folder for a platform, when a
+ * save/state has no `emulator` field to translate directly. `overrides`
+ * (from `DEFAULT_CORE_BY_PLATFORM` in .env) take precedence over the
+ * built-in table above; returns null for a platform with no default at
+ * all (falls back to the old flat, no-subfolder behavior — see
+ * manifest.ts).
+ */
+export function defaultCoreForPlatform(
+  platformFsSlug: string,
+  overrides: Record<string, string>,
+): string | null {
+  return overrides[platformFsSlug] ?? DEFAULT_CORE_BY_PLATFORM[platformFsSlug] ?? null;
+}
+
 /** RetroArch local directory name (e.g. "Snes9x") -> RomM's `emulator` convention (e.g. "snes9x"). */
 export function toRommEmulator(retroarchDirName: string): string {
   return retroarchDirName.toLowerCase().replace(/[ -]/g, "_");
