@@ -4,7 +4,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
-import { buildServerManifest } from "./manifest.js";
+import { buildServerManifest, listSaveStateEntries, type ManifestEntry } from "./manifest.js";
 import {
   resolveAssetPath,
   findAssetForDownload,
@@ -91,12 +91,14 @@ async function handleUnlock(res: ServerResponse) {
 }
 
 /**
- * PROPFIND is only implemented for the "roms/" tree, which exists purely so
- * a real WebDAV client (e.g. iOS Files app's "Connect to Server") can
- * browse and download a copy of the RomM library. RetroArch's own Cloud
- * Sync client never sends PROPFIND — verified against its source — so
- * saves/states/manifest.server intentionally aren't listable here; nothing
- * in that flow depends on directory listings.
+ * PROPFIND is implemented for the "roms/" tree (source: RomM's own rom
+ * listing) and the "saves/"/"states/" trees (source: the same {path, hash,
+ * size} entries the manifest.server synthesizer already computes — see
+ * manifest.ts) purely so a real WebDAV client (e.g. iOS Files app's
+ * "Connect to Server") can browse them. RetroArch's own Cloud Sync client
+ * never sends PROPFIND — verified against its source — so none of this is
+ * on RetroArch's actual sync path; it exists solely for read-only human
+ * browsing.
  */
 async function handlePropfind(reqPath: string, req: IncomingMessage, res: ServerResponse) {
   const depth = req.headers["depth"] === "0" ? 0 : 1; // "1" and "infinity" both treated as one level
@@ -106,13 +108,18 @@ async function handlePropfind(reqPath: string, req: IncomingMessage, res: Server
 
   let entries: PropfindEntry[] | null;
   if (parts.length === 0) {
-    entries = depth === 0 ? [rootEntry()] : [rootEntry(), romsRootEntry()];
+    entries =
+      depth === 0
+        ? [rootEntry()]
+        : [rootEntry(), romsRootEntry(), virtualRootEntry("saves"), virtualRootEntry("states")];
   } else if (parts.length === 1 && parts[0] === "roms") {
     entries = depth === 0 ? [romsRootEntry()] : [romsRootEntry(), ...(await platformEntries())];
   } else if (parts.length === 2 && parts[0] === "roms") {
     entries = await platformListing(parts[1], depth);
   } else if (parts.length === 3 && parts[0] === "roms") {
     entries = await romFileEntry(parts[1], parts[2]);
+  } else if (parts[0] === "saves" || parts[0] === "states") {
+    entries = await saveStateListing(parts, depth);
   } else {
     entries = null;
   }
@@ -179,6 +186,66 @@ async function romFileEntry(slug: string, fileName: string): Promise<PropfindEnt
       contentLength: file.sizeBytes,
       lastModified: new Date(file.updatedAt),
     },
+  ];
+}
+
+function virtualRootEntry(name: "saves" | "states"): PropfindEntry {
+  return { href: `${name}/`, isCollection: true, displayName: name };
+}
+
+function toFileEntry(entry: ManifestEntry): PropfindEntry {
+  return {
+    href: entry.path,
+    isCollection: false,
+    displayName: entry.path.split("/").pop()!,
+    contentLength: entry.size,
+    lastModified: entry.updatedAt ? new Date(entry.updatedAt) : undefined,
+  };
+}
+
+/**
+ * Generic, variable-depth virtual directory listing for saves/states,
+ * derived from the same flat {path, hash, size} entry list manifest.ts
+ * builds for manifest.server — no separate directory tree is maintained,
+ * it's reconstructed on the fly from the path segments. Needed because PSP
+ * save bundles nest up to 5 levels deep
+ * (saves/PPSSPP/PSP/SAVEDATA/<folder>/<file>), unlike every other
+ * save/state which is a flat one-segment file directly under saves/states/
+ * (or one emulator-subfolder segment deeper) — a fixed-depth listing like
+ * roms/'s platformListing above can't handle both shapes.
+ */
+async function saveStateListing(parts: string[], depth: 0 | 1): Promise<PropfindEntry[] | null> {
+  const clean = parts.join("/");
+  const allEntries = await listSaveStateEntries();
+
+  const exactFile = parts.length > 1 ? allEntries.find((e) => e.path === clean) : undefined;
+  if (exactFile) return [toFileEntry(exactFile)];
+
+  const prefix = `${clean}/`;
+  const hasChildren = allEntries.some((e) => e.path.startsWith(prefix));
+  // saves/ and states/ themselves always exist (even empty); any deeper
+  // path segment must actually be a prefix of something real, or it's 404.
+  if (parts.length > 1 && !hasChildren) return null;
+
+  const self: PropfindEntry = { href: prefix, isCollection: true, displayName: parts[parts.length - 1]! };
+  if (depth === 0) return [self];
+
+  const childFolders = new Set<string>();
+  const childFiles: ManifestEntry[] = [];
+  for (const e of allEntries) {
+    if (!e.path.startsWith(prefix)) continue;
+    const rest = e.path.slice(prefix.length);
+    const slash = rest.indexOf("/");
+    if (slash === -1) childFiles.push(e);
+    else childFolders.add(rest.slice(0, slash));
+  }
+
+  return [
+    self,
+    ...[...childFolders]
+      .sort()
+      .map((f): PropfindEntry => ({ href: `${prefix}${f}/`, isCollection: true, displayName: f })),
+    ...childFiles.map(toFileEntry),
   ];
 }
 

@@ -307,6 +307,7 @@ export async function getPspFile(info: PspFilePath): Promise<Buffer | null> {
 export interface PspManifestEntry {
   path: string;
   hash: string;
+  size: number;
 }
 
 /**
@@ -345,6 +346,7 @@ export async function buildPspManifestEntries(): Promise<PspManifestEntry[]> {
       entries.push({
         path: `saves/${dir}/PSP/SAVEDATA/${saveFolder}/${member.name}`,
         hash: crypto.createHash("md5").update(member.data).digest("hex"),
+        size: member.data.length,
       });
     }
   }

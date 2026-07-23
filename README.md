@@ -9,7 +9,10 @@ WebDAV volume.
 It also exposes RomM's rom library as a real, browsable WebDAV directory
 tree under `/roms/`, so it can be mounted as a network drive from iOS
 Files (or any WebDAV client) to pull roms onto a device — see "Downloading
-roms" below.
+roms" below. `/saves/` and `/states/` are browsable the same way, read-only,
+purely so you can see what's actually stored (including each individual
+member file of a PSP save bundle) from a WebDAV client — see "Browsing
+saves and states" below.
 
 ## Why not a full WebDAV server library
 
@@ -25,10 +28,11 @@ middleware is built for, so this shim is a small hand-rolled HTTP server
 (`src/webdavServer.ts`) instead — simpler to reason about than fighting a
 PROPFIND-XML-oriented library for verbs it doesn't even use.
 
-The one place real `PROPFIND` support was added is the `/roms/` browsing
-tree (`src/webdavXml.ts` builds the `DAV:multistatus` XML) — that part
-exists purely for generic WebDAV clients like iOS Files, not for
-RetroArch's Cloud Sync, which never touches `/roms/` at all.
+The places real `PROPFIND` support was added are the `/roms/`, `/saves/`
+and `/states/` browsing trees (`src/webdavXml.ts` builds the
+`DAV:multistatus` XML) — that exists purely for generic WebDAV clients like
+iOS Files, not for RetroArch's Cloud Sync, which never sends `PROPFIND` at
+all.
 
 ## How it works
 
@@ -316,6 +320,26 @@ built:
   the actual transfer always uses the real `Content-Length` from RomM's
   response, so nothing is truncated or misreported once the download
   starts.
+
+## Browsing saves and states
+
+`/saves/` and `/states/` support `PROPFIND` the same way `/roms/` does, so a
+WebDAV client (subject to the same iOS Files caveats as roms above) can
+browse exactly what's stored for each game — including, for PPSSPP, each
+individual file inside a save bundle (`PARAM.SFO`, the actual save data,
+`ICON0.PNG`, ...), not just the zip as one opaque blob. This is read-only
+browsing for humans; it has nothing to do with RetroArch's own sync, which
+never issues `PROPFIND` (see above).
+
+The listing is derived from the exact same `{path, hash}` computation that
+builds `manifest.server` (`src/manifest.ts`'s `listSaveStateEntries`), so
+what you see in a WebDAV client always matches what RetroArch would sync —
+there's no separate, possibly-drifting source of truth for the two. The
+tree depth is dynamic rather than fixed like `/roms/`'s two levels
+(platform/file), since PSP paths go five levels deep
+(`saves/PPSSPP/PSP/SAVEDATA/<folder>/<file>`) while every other save/state
+is one or two levels; `src/webdavServer.ts`'s `saveStateListing` walks the
+flat path list to reconstruct whatever depth is actually there.
 
 ## Configuration (env vars)
 

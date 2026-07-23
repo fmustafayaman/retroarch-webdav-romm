@@ -3,6 +3,13 @@ import { pickLatest, splitAssetFileName, stripShimStamp } from "./assetSync.js";
 import { toRetroArchDirName } from "./emulatorNames.js";
 import { buildPspManifestEntries, isPspBundleFileName } from "./pspSave.js";
 
+export interface ManifestEntry {
+  path: string;
+  hash: string;
+  size: number;
+  updatedAt?: string;
+}
+
 /**
  * RetroArch's cloud sync diffs against a JSON manifest of {path, hash}
  * entries fetched from `manifest.server` at the WebDAV root before every
@@ -21,8 +28,17 @@ import { buildPspManifestEntries, isPspBundleFileName } from "./pspSave.js";
  * (assetSync.ts's putAssetContent) always create a fresh shim-managed row
  * rather than overwriting whatever this surfaced, so old entries are only
  * ever read, never mutated.
+ *
+ * Also reused as the source of truth for PROPFIND browsing of saves/states
+ * (webdavServer.ts) — see `listSaveStateEntries`.
  */
 export async function buildServerManifest(): Promise<string> {
+  const entries = await listSaveStateEntries();
+  return JSON.stringify(entries.map((e) => ({ path: e.path, hash: e.hash })));
+}
+
+/** The full {path, hash, size} entry list — manifest.server (above) only needs path+hash; PROPFIND browsing (webdavServer.ts) needs size too. */
+export async function listSaveStateEntries(): Promise<ManifestEntry[]> {
   const [allSaves, states, pspEntries] = await Promise.all([
     listSaves(),
     listStates(),
@@ -73,7 +89,7 @@ export async function buildServerManifest(): Promise<string> {
   const latestStatePerRomAndSlot = latestByKey(states, (s) => `${s.rom_id}:${stateSuffix(s)}`);
   const stateEntries = await buildEntries(latestStatePerRomAndSlot, "states", romName, stateSuffix);
 
-  return JSON.stringify([...saveEntries, ...stateEntries, ...pspEntries]);
+  return [...saveEntries, ...stateEntries, ...pspEntries];
 }
 
 function latestByKey(assets: RommAsset[], key: (a: RommAsset) => string): RommAsset[] {
@@ -92,7 +108,7 @@ async function buildEntries(
   prefix: "saves" | "states",
   romName: (romId: number) => Promise<string | null>,
   suffixOf: (asset: RommAsset) => string,
-): Promise<{ path: string; hash: string }[]> {
+): Promise<ManifestEntry[]> {
   const entries = await Promise.all(
     assets.map(async (a) => {
       const base = await romName(a.rom_id);
@@ -113,10 +129,10 @@ async function buildEntries(
       return toEntry(`${dir}/${base}.${suffixOf(a)}`, a);
     }),
   );
-  return entries.filter((e): e is { path: string; hash: string } => e !== null);
+  return entries.filter((e): e is ManifestEntry => e !== null);
 }
 
-function toEntry(path: string, asset: RommAsset) {
+function toEntry(path: string, asset: RommAsset): ManifestEntry {
   return {
     path,
     // content_hash may be null on older RomM rows that predate hashing;
@@ -124,5 +140,7 @@ function toEntry(path: string, asset: RommAsset) {
     // through a diff (TODO: this fallback can't detect same-size same-second
     // edits — a real fix means RomM guaranteeing content_hash is always set).
     hash: asset.content_hash ?? `${asset.file_size_bytes}-${asset.updated_at}`,
+    size: asset.file_size_bytes,
+    updatedAt: asset.updated_at,
   };
 }
