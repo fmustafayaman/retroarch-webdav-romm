@@ -481,6 +481,20 @@ async function handleMove(reqPath: string, req: IncomingMessage, res: ServerResp
   const destination = req.headers["destination"];
   logger.debug({ from: reqPath, to: destination }, "MOVE received");
 
+  // Same best-effort no-op as handleDelete above, and for the same reason:
+  // deleting a single member out of a PSP save bundle isn't implemented.
+  // Verified live this matters — before this check, a MOVE-to-deleted for
+  // a PSP member (e.g. "PARAM.SFO") fell through to the generic
+  // resolveAssetPath/deleteAssetContent path below, which tried to find a
+  // RomM rom literally titled "PARAM" — never matches, so the delete
+  // silently no-op'd. The PSP bundle happened to survive, but only by
+  // accident (a bogus lookup failing), not by design — this makes "leave
+  // PSP bundles alone on MOVE" an intentional, correct no-op instead.
+  if (resolvePspPath(reqPath)) {
+    res.writeHead(204).end();
+    return;
+  }
+
   // RetroArch only issues MOVE to back up a file to "deleted/<path>-<timestamp>"
   // as a soft-delete when non-destructive delete mode is on. We treat any MOVE
   // whose destination lands under deleted/ as a delete of the source.

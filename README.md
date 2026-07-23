@@ -167,6 +167,19 @@ internally.
 
 ## Known limitations
 
+- **Deleting a local save/state that's already been synced before and then
+  syncing again deletes it from RomM too — it does NOT restore it from the
+  cloud.** Verified live, the hard way: RetroArch's Cloud Sync is a real
+  two-way sync, so if it previously synced a file and later finds it
+  missing locally, it interprets that as "the user deleted this" and
+  mirrors the deletion to the server (via a `MOVE` to `deleted/...`, which
+  this shim treats as a real delete). The "missing files get pulled down
+  from the cloud automatically" behavior described earlier in this README
+  only applies to files RetroArch has **never synced before** — a fresh
+  device/install, or a library's pre-existing saves that predate this
+  shim. If you want a clean local slate without touching what's on RomM,
+  don't delete-then-sync — disable Cloud Sync first, delete locally, then
+  either leave it off or set up sync fresh on a separate save profile.
 - **One RomM account, one WebDAV login.** This is a single-user tool by
   design, not a multi-tenant server.
 - **No real conflict resolution.** If you save from two devices between
