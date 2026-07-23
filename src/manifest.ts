@@ -10,6 +10,7 @@ import {
 import { assetHistoryKey, sortByRecency, splitAssetFileName, stripShimStamp } from "./assetSync.js";
 import { toRetroArchDirName } from "./emulatorNames.js";
 import { buildPspManifestEntries, isPspBundleFileName } from "./pspSave.js";
+import { listLocalBlobs } from "./localBlobStore.js";
 
 export interface ManifestEntry {
   path: string;
@@ -38,8 +39,22 @@ export interface ManifestEntry {
  * ever read, never mutated.
  */
 export async function buildServerManifest(): Promise<string> {
-  const entries = await listSaveStateEntries();
+  const [saveStateEntries, blobEntries] = await Promise.all([
+    listSaveStateEntries(),
+    listAllLocalBlobs(),
+  ]);
+  const entries = [...saveStateEntries, ...blobEntries];
   return JSON.stringify(entries.map((e) => ({ path: e.path, hash: e.hash })));
+}
+
+/** "config/", "thumbnails/", "system/" — plain files on disk (localBlobStore.ts), nothing to do with RomM. See handleGetOrHead/handlePut/handleDelete in webdavServer.ts for the read/write side. */
+async function listAllLocalBlobs(): Promise<ManifestEntry[]> {
+  const [configEntries, thumbnailEntries, systemEntries] = await Promise.all([
+    listLocalBlobs("config"),
+    listLocalBlobs("thumbnails"),
+    listLocalBlobs("system"),
+  ]);
+  return [...configEntries, ...thumbnailEntries, ...systemEntries];
 }
 
 /** The full {path, hash, size} entry list for exactly what RetroArch would sync — one entry per (rom, slot), always the newest. Manifest.server (above) only needs path+hash; PROPFIND browsing needs size too, but still just the "current" entry — see listSaveStateHistoryEntries for the full history. */

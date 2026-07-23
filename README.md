@@ -2,10 +2,13 @@
 
 A small server that lets RetroArch's built-in **Cloud Sync** feature
 (Settings → Saving → Cloud Sync) use a self-hosted [RomM](https://github.com/rommapp/romm)
-instance to store your save files and save states. RomM is the only place
-data actually lives — this project doesn't store anything itself, it just
+instance to store your save files and save states. RomM is the source of
+truth for saves/states — this project doesn't store those itself, it just
 translates between "what RetroArch expects from a WebDAV server" and "what
-RomM's API actually offers."
+RomM's API actually offers." RetroArch's other Cloud Sync categories
+(config, thumbnails, system files) have nothing to do with RomM, so this
+shim stores those as plain files on its own disk instead — see "Setting
+up RetroArch" below.
 
 It also lets you **browse and download roms, saves, and states** from any
 WebDAV client (like the Files app on iOS, or Finder on macOS), read-only.
@@ -49,13 +52,17 @@ Settings → Saving → Cloud Sync:
 | Cloud Sync Username | your `WEBDAV_USERNAME` |
 | Cloud Sync Password | your `WEBDAV_PASSWORD` |
 | Sync Saves | On |
-| Sync Configuration | **Off** |
-| Sync Thumbnails | **Off** |
-| Sync System Files | **Off** |
+| Sync Configuration | On, if you want it — see below |
+| Sync Thumbnails | On, if you want it — see below |
+| Sync System Files | On, if you want it — see below |
 
-Only "Sync Saves" is supported — RomM has nowhere to put config files,
-thumbnails, or system files, so leave those off. (If you leave them on
-anyway, nothing breaks — they're just silently ignored.)
+"Sync Saves" goes to RomM. The other three have nothing to do with RomM —
+RomM has no concept of config files, thumbnails, or system files — so this
+shim stores them as plain files on its own disk instead, at
+`LOCAL_BLOB_DIR`. **This only works if that directory is a real persistent
+mount** (a host bind mount or volume — see "Running" below); on plain
+container storage, turning these on just means losing that data on every
+redeploy/restart, so leave them off unless you've set up the mount.
 
 Trigger a manual **Sync Now** the first time and check the server logs
 (`LOG_LEVEL=debug`) if anything looks wrong. RetroArch's own error message
@@ -145,6 +152,7 @@ See `.env.example` for the full list with comments. The essentials:
 | `LOG_LEVEL` | `trace\|debug\|info\|warn\|error` |
 | `CACHE_TTL_SECONDS` | How long RomM listing results are cached in memory (default `30`, `0` disables) — keeps browsing fast without hammering RomM |
 | `HISTORY_KEEP_COUNT` | Max history rows kept per save/state slot before old ones are auto-deleted (default `20`, `0` disables pruning) |
+| `LOCAL_BLOB_DIR` | Where "config/"/"thumbnails/"/"system/" Cloud Sync categories are stored (default `/data/blobs`) — **must be a persistent mount**, see Running below |
 
 ## Running
 
@@ -156,14 +164,21 @@ npm run dev             # or: npm run build && npm start
 
 ```bash
 docker build -t retroarch-webdav-romm .
-docker run --env-file .env -p 8080:8080 retroarch-webdav-romm
+docker run --env-file .env -p 8080:8080 \
+  -v /path/on/host/rommsync-blobs:/data/blobs \
+  retroarch-webdav-romm
 ```
+
+The `-v` mount is only needed if you turn on Sync Configuration/Thumbnails/
+System Files in RetroArch (see "Setting up RetroArch" above) — skip it if
+you're only syncing saves, since those go to RomM, not this mount.
 
 `docker-compose.yml` is set up to deploy on Dokploy or Coolify alongside an
 existing RomM stack — set the env vars in the platform's UI (or a mounted
-`.env`), and optionally join RomM's Compose network instead of publishing
-the port directly if the platform's reverse proxy will route to it
-internally.
+`.env`), point its `volumes:` entry at a real path on the host (or a named
+volume) instead of the placeholder, and optionally join RomM's Compose
+network instead of publishing the port directly if the platform's reverse
+proxy will route to it internally.
 
 ## Known limitations
 
@@ -182,10 +197,21 @@ internally.
   either leave it off or set up sync fresh on a separate save profile.
 - **One RomM account, one WebDAV login.** This is a single-user tool by
   design, not a multi-tenant server.
-- **No real conflict resolution.** If you save from two devices between
-  syncs, whichever upload happened most recently is what every device
-  sees next. The other save isn't deleted, just not surfaced as a
-  conflict — RomM keeps every upload as history.
+- **No real conflict resolution — and this can get a file stuck, not just
+  "last write wins."** Verified live: RetroArch's Cloud Sync keeps its own
+  local record of what it last synced (`manifest.local` on-device) and
+  does a real three-way comparison against that, the server, and the
+  current local file. If a save/state changed on **both** sides
+  independently since the device's last successful sync (e.g. played via
+  RomM's web player *and* played on this device, without syncing in
+  between), RetroArch calls it a conflict and — deliberately — does
+  nothing: no upload, no download, silently skipped, every single sync,
+  until something breaks the tie. Official builds only gained a menu
+  option to resolve this ("Resolve Conflicts: Keep Local/Server") after
+  v1.22.2; on older versions the only way out is clearing whichever
+  side's history is easiest to redo (usually: delete the stuck save/state
+  from RomM directly, so the next sync sees "nothing on the server" and
+  does a clean upload instead of a conflict).
 - **History is capped at `HISTORY_KEEP_COUNT` per slot (default 20), not
   unlimited.** Every save/state upload adds a new row in RomM rather than
   replacing the old one; once a slot passes the cap, the oldest rows
@@ -302,5 +328,32 @@ including literal duplicate requests fired milliseconds apart. Listing
 calls are now cached in memory for `CACHE_TTL_SECONDS` (default 30s), and
 invalidated immediately whenever this shim uploads or deletes something
 itself, so its own writes are always visible right away.
+
+</details>
+
+<details>
+<summary>Why manifest hashes have to be real MD5s, not a stand-in</summary>
+
+The manifest reports a `hash` per file, and RetroArch compares it against
+the real MD5 it computes locally over the actual file bytes
+(`task_cloud_sync_md5_rfile` in RetroArch's own source) — so this shim's
+reported hash has to be that same real MD5, or the comparison is
+meaningless. RomM's own `content_hash` field is often null (verified
+live: not populated at all on some instances — its hashing job apparently
+never ran), so early on this fell back to a synthetic `size-updated_at`
+string when it was missing. That's not a content hash and can never equal
+a real MD5 — but the mismatch stayed invisible as long as RetroArch's own
+local sync history (`manifest.local`) still held a matching copy of that
+same synthetic string from a prior sync (comparing synthetic-to-synthetic
+still "worked" as a stand-in for equality). The moment that history didn't
+exist — a fresh device, or `manifest.local` reset for any reason —
+RetroArch's diff has no baseline to fall back on and does a strict
+real-hash comparison instead; synthetic-vs-real can never match, so
+*every* affected file reports as an unresolvable conflict and never syncs
+again. Reproduced live across an entire library at once, not just one
+file. Fixed by downloading and hashing the content for real
+(`crypto.createHash("md5")`, same as PSP bundle members already did) when
+`content_hash` is null, cached per asset id for the process lifetime since
+a RomM asset row is immutable once created.
 
 </details>

@@ -14,8 +14,17 @@ services:
       PORT: 8080
       BIND_ADDRESS: 0.0.0.0
       LOG_LEVEL: info
+      LOCAL_BLOB_DIR: /data/blobs
     ports:
       - "8080:8080"
+    volumes:
+      # Backs "config/", "thumbnails/", "system/" cloud-sync categories —
+      # RomM has no store for these, so they're plain files here instead.
+      # A host bind mount (shown) survives container recreation; without
+      # this, enabling those categories in RetroArch just loses their data
+      # on every redeploy. Point the left side at wherever you keep
+      # persistent data on the host.
+      - /path/on/host/rommsync-blobs:/data/blobs
     # If RomM runs as another Compose service on this same host/stack, drop
     # the ports mapping above (let the platform's reverse proxy handle TLS
     # termination and routing instead) and join RomM's network here, e.g.:

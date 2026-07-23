@@ -22,6 +22,14 @@ import { listRomPlatforms, listRomFiles, findRomFile } from "./romBrowser.js";
 import { fetchRomContentStream, listSaves, listStates, type RommAsset } from "./rommClient.js";
 import { buildMultistatus, type PropfindEntry } from "./webdavXml.js";
 import { resolvePspPath, getPspFile, putPspFile } from "./pspSave.js";
+import { readLocalBlob, writeLocalBlob, deleteLocalBlob } from "./localBlobStore.js";
+
+const LOCAL_BLOB_CATEGORIES = ["config", "thumbnails", "system"];
+
+function isLocalBlobPath(reqPath: string): boolean {
+  const top = reqPath.split("/")[0];
+  return LOCAL_BLOB_CATEGORIES.includes(top ?? "");
+}
 
 const MANIFEST_PATH = "manifest.server";
 
@@ -328,6 +336,22 @@ async function handleGetOrHead(
     return;
   }
 
+  if (isLocalBlobPath(reqPath)) {
+    const data = await readLocalBlob(reqPath);
+    if (!data) {
+      res.writeHead(404).end();
+      return;
+    }
+    if (headOnly) {
+      res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": data.length });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": data.length });
+    res.end(data);
+    return;
+  }
+
   const psp = resolvePspPath(reqPath);
   if (psp === "ignore") {
     res.writeHead(404).end();
@@ -398,6 +422,17 @@ async function handlePut(reqPath: string, req: IncomingMessage, res: ServerRespo
     return;
   }
 
+  if (isLocalBlobPath(reqPath)) {
+    try {
+      await writeLocalBlob(reqPath, body);
+      res.writeHead(201).end();
+    } catch (err) {
+      logger.error({ err, path: reqPath }, "failed to write local blob");
+      res.writeHead(204).end();
+    }
+    return;
+  }
+
   const psp = resolvePspPath(reqPath);
   if (psp === "ignore") {
     logger.debug({ path: reqPath }, "PSP engine cache file, not save data — discarding");
@@ -418,11 +453,7 @@ async function handlePut(reqPath: string, req: IncomingMessage, res: ServerRespo
 
   const resolved = resolveAssetPath(reqPath);
   if (!resolved) {
-    logger.warn(
-      { path: reqPath },
-      "PUT outside saves/ or states/ — not backed by RomM in v1, discarding. " +
-        "Disable Configuration/Thumbnails/System File sync in RetroArch's Cloud Sync settings.",
-    );
+    logger.warn({ path: reqPath }, "PUT outside saves/states/config/thumbnails/system — discarding");
     res.writeHead(204).end();
     return;
   }
@@ -448,6 +479,17 @@ async function handlePut(reqPath: string, req: IncomingMessage, res: ServerRespo
 }
 
 async function handleDelete(reqPath: string, res: ServerResponse) {
+  if (isLocalBlobPath(reqPath)) {
+    try {
+      const deleted = await deleteLocalBlob(reqPath);
+      logger.debug({ path: reqPath, deleted }, "local blob delete processed");
+    } catch (err) {
+      logger.warn({ err, path: reqPath }, "local blob delete failed, soft-failing");
+    }
+    res.writeHead(204).end();
+    return;
+  }
+
   // Best-effort no-op — deleting a single member out of a PSP save bundle
   // isn't implemented (RetroArch treats cloud sync deletes as best-effort
   // anyway, matching the rest of this shim's DELETE handling).
@@ -480,6 +522,22 @@ async function handleMkcol(res: ServerResponse) {
 async function handleMove(reqPath: string, req: IncomingMessage, res: ServerResponse) {
   const destination = req.headers["destination"];
   logger.debug({ from: reqPath, to: destination }, "MOVE received");
+
+  if (isLocalBlobPath(reqPath)) {
+    const destPath = destination
+      ? decodeURIComponent(new URL(String(destination)).pathname).replace(/^\/+/, "")
+      : "";
+    if (destPath.startsWith("deleted/")) {
+      try {
+        const deleted = await deleteLocalBlob(reqPath);
+        logger.debug({ path: reqPath, deleted }, "local blob move-to-deleted processed");
+      } catch (err) {
+        logger.warn({ err, path: reqPath }, "local blob move-to-deleted failed, soft-failing");
+      }
+    }
+    res.writeHead(204).end();
+    return;
+  }
 
   // Same best-effort no-op as handleDelete above, and for the same reason:
   // deleting a single member out of a PSP save bundle isn't implemented.

@@ -58,4 +58,12 @@ export const config = {
   // each PSP game's save — see pspSave.ts. JSON object, e.g.
   // {"ULUS10336":"Crisis Core - Final Fantasy VII"}.
   pspSerialMap: JSON.parse(process.env.PSP_SERIAL_MAP ?? "{}") as Record<string, string>,
+
+  // Where "config/", "thumbnails/", and "system/" cloud-sync categories
+  // are stored — see localBlobStore.ts. RomM has no generic blob store for
+  // these (only saves/states/roms), so they're kept as plain files on
+  // disk instead, entirely separate from RomM. Mount this path to
+  // persistent storage (a host bind mount or volume) or these are lost on
+  // every redeploy/restart — see README "Running".
+  localBlobDir: process.env.LOCAL_BLOB_DIR ?? "/data/blobs",
 };
