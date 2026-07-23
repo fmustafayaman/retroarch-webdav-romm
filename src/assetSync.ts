@@ -103,22 +103,37 @@ export async function findAssetForDownload(
 }
 
 /**
- * Picks the most recently updated asset, breaking ties on `id`. Verified
- * against a live instance that a batch of older rows can share the exact
- * same `updated_at` (a bulk migration timestamp, not real edit times) —
- * without a deterministic tiebreaker, this would pick whichever entry
- * happened to come first in `/api/saves`'s response order, which isn't
- * guaranteed stable across separate requests (confirmed: the manifest
- * build and a subsequent download picked different "winners" among tied
- * entries before this fix). `id` is immutable and monotonically
- * increasing, so it's a safe, stable tiebreaker.
+ * Newest first, breaking ties on `id`. Verified against a live instance
+ * that a batch of older rows can share the exact same `updated_at` (a bulk
+ * migration timestamp, not real edit times) — without a deterministic
+ * tiebreaker, "the newest" isn't well-defined and could disagree between
+ * two separate requests (confirmed: the manifest build and a subsequent
+ * download picked different "winners" among tied entries before this
+ * fix). `id` is immutable and monotonically increasing, so it's a safe,
+ * stable tiebreaker.
  */
-export function pickLatest(assets: RommAsset[]): RommAsset {
-  return assets.reduce((latest, a) => {
-    if (a.updated_at > latest.updated_at) return a;
-    if (a.updated_at === latest.updated_at && a.id > latest.id) return a;
-    return latest;
+export function sortByRecency(assets: RommAsset[]): RommAsset[] {
+  return [...assets].sort((a, b) => {
+    if (a.updated_at !== b.updated_at) return a.updated_at > b.updated_at ? -1 : 1;
+    return b.id - a.id;
   });
+}
+
+export function pickLatest(assets: RommAsset[]): RommAsset {
+  return sortByRecency(assets)[0]!;
+}
+
+/**
+ * Groups a save/state into the same "slot" bucket manifest.ts's history
+ * listing uses — one save per rom (saves have no per-slot filename
+ * variation once RomM's own auto-appended bracket is stripped, since
+ * RetroArch always writes the same base name for a game's save), one
+ * bucket per rom+suffix for states (RetroArch numbers state slots by
+ * filename suffix: `.state`, `.state1`, ..., `.state.auto`).
+ */
+export function assetHistoryKey(kind: AssetKind, asset: RommAsset): string {
+  if (kind === "saves") return String(asset.rom_id);
+  return `${asset.rom_id}:${splitAssetFileName(stripShimStamp(asset.file_name)).suffix}`;
 }
 
 /**
@@ -226,6 +241,38 @@ export async function putAssetContent(
   );
   if (kind === "saves") await uploadNewSave(rom.id, uniqueFileName, content, rommEmulator);
   else await uploadNewState(rom.id, uniqueFileName, content, rommEmulator);
+
+  await pruneHistory(kind, rom.id, fileName).catch((err) =>
+    logger.warn({ err, kind, romId: rom.id, fileName }, "history prune failed, leaving extra rows in place"),
+  );
+}
+
+/**
+ * Deletes the oldest rows in a (rom, slot) history bucket once it exceeds
+ * `HISTORY_KEEP_COUNT` (config.ts) — every upload is a new row (see above),
+ * so without this the history browsable via WebDAV (and RomM's own save
+ * list) grows without bound. Runs right after the upload that pushed a
+ * bucket over the limit, keyed the same way manifest.ts's history listing
+ * groups entries, so what gets pruned lines up with what you'd actually
+ * see extra of when browsing.
+ */
+async function pruneHistory(kind: AssetKind, romId: number, fileName: string): Promise<void> {
+  const keep = config.historyKeepCount;
+  if (keep <= 0) return;
+
+  const suffix = kind === "states" ? splitAssetFileName(fileName).suffix : null;
+  const key = suffix === null ? String(romId) : `${romId}:${suffix}`;
+
+  const bucket = (await listAssets(kind)).filter(
+    (a) => a.rom_id === romId && assetHistoryKey(kind, a) === key,
+  );
+  if (bucket.length <= keep) return;
+
+  const excess = sortByRecency(bucket).slice(keep);
+  const ids = excess.map((a) => a.id);
+  if (kind === "saves") await deleteSaves(ids);
+  else await deleteStates(ids);
+  logger.info({ kind, romId, key, deletedCount: ids.length, keep }, "pruned old save/state history");
 }
 
 /**

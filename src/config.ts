@@ -45,6 +45,13 @@ export const config = {
   // sync pass (which can touch dozens of files back-to-back).
   cacheTtlSeconds: Number(process.env.CACHE_TTL_SECONDS ?? 30),
 
+  // Max history rows kept per (rom, save-slot) / (rom, state-slot) — every
+  // upload creates a new row (see assetSync.ts), so without a cap this
+  // grows forever. Once a slot exceeds this count, the oldest rows beyond
+  // it are deleted right after the upload that pushed it over. 0 disables
+  // pruning (unlimited history, the old default).
+  historyKeepCount: Number(process.env.HISTORY_KEEP_COUNT ?? 20),
+
   // PSP serial (e.g. "ULUS10336") -> rom title, for matching a PPSSPP save
   // folder to a RomM rom. RomM has no PSP serial field to look this up
   // automatically (checked), so this is required for the *first* sync of

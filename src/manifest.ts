@@ -1,5 +1,5 @@
 import { getRomById, listSaves, listStates, type RommAsset } from "./rommClient.js";
-import { splitAssetFileName, stripShimStamp } from "./assetSync.js";
+import { assetHistoryKey, sortByRecency, splitAssetFileName, stripShimStamp } from "./assetSync.js";
 import { toRetroArchDirName } from "./emulatorNames.js";
 import { buildPspManifestEntries, isPspBundleFileName } from "./pspSave.js";
 
@@ -101,7 +101,7 @@ export function parseHistoryAssetId(fileName: string): number | null {
 // simple, single-segment) file_extension instead. One save per rom: unlike
 // states, consoles conventionally have a single .srm/.sav per game, not
 // multiple numbered slots.
-const saveKey = (a: RommAsset) => String(a.rom_id);
+const saveKey = (a: RommAsset) => assetHistoryKey("saves", a);
 const saveSuffix = (a: RommAsset) => a.file_extension;
 
 // States commonly have multiple slots per rom (RetroArch names them
@@ -113,9 +113,10 @@ const saveSuffix = (a: RommAsset) => a.file_extension;
 // — verified live. Deriving the suffix ourselves via `splitAssetFileName`
 // (after stripping our own upload-uniqueness stamp, if present) handles
 // this correctly, the same logic already used to resolve which rom a
-// save/state belongs to.
+// save/state belongs to (and to group history buckets — see assetSync.ts's
+// `assetHistoryKey`, `pruneHistory`).
 const stateSuffix = (a: RommAsset) => splitAssetFileName(stripShimStamp(a.file_name)).suffix;
-const stateKey = (a: RommAsset) => `${a.rom_id}:${stateSuffix(a)}`;
+const stateKey = (a: RommAsset) => assetHistoryKey("states", a);
 
 function makeRomNameResolver(): (romId: number) => Promise<string | null> {
   const cache = new Map<number, string | null>();
@@ -141,21 +142,6 @@ function groupByKey(assets: RommAsset[], key: (a: RommAsset) => string): Map<str
     else groups.set(k, [asset]);
   }
   return groups;
-}
-
-/**
- * Newest first, breaking ties on `id`. Verified against a live instance
- * that a batch of older rows can share the exact same `updated_at` (a bulk
- * migration timestamp, not real edit times) — without a deterministic
- * tiebreaker, "the newest" isn't well-defined and could disagree between
- * two separate requests. `id` is immutable and monotonically increasing,
- * so it's a safe, stable tiebreaker.
- */
-function sortByRecency(assets: RommAsset[]): RommAsset[] {
-  return [...assets].sort((a, b) => {
-    if (a.updated_at !== b.updated_at) return a.updated_at > b.updated_at ? -1 : 1;
-    return b.id - a.id;
-  });
 }
 
 async function buildEntries(

@@ -110,17 +110,18 @@ What you see always matches what RetroArch would sync, because it's built
 from the same data. For PPSSPP saves, you'll see each individual file
 inside a save bundle rather than one opaque zip.
 
-**Every save/state you've ever synced is there, not just the latest one.**
-RomM keeps every upload as its own row, so if you've made 10 manual states
-for a game, you'll see all 10 — the current one under its normal name
-(`Chrono Trigger (USA).state`), older ones alongside it with a date and id
-tacked on (`Chrono Trigger (USA) [2026-07-20 10-30-00 #145].state`), newest
-first. Download whichever one you want; to actually use it in RetroArch,
-rename the file back to the plain name and drop it into RetroArch's local
-save folder — RetroArch itself has no concept of "restore an older cloud
-save," so this is a manual step. (PPSSPP saves are the one exception —
-only the current bundle exists, by design; see the PSP section above for
-why.)
+**Recent history is there too, not just the latest save/state.** RomM
+keeps every upload as its own row (up to `HISTORY_KEEP_COUNT`, default 20,
+per slot — see Configuration below), so if you've made several manual
+states for a game, you'll see all of them — the current one under its
+normal name (`Chrono Trigger (USA).state`), older ones alongside it with a
+date and id tacked on (`Chrono Trigger (USA) [2026-07-20 10-30-00
+#145].state`), newest first. Download whichever one you want; to actually
+use it in RetroArch, rename the file back to the plain name and drop it
+into RetroArch's local save folder — RetroArch itself has no concept of
+"restore an older cloud save," so this is a manual step. (PPSSPP saves are
+the one exception — only the current bundle exists, by design; see the
+PSP section above for why.)
 
 **A note on speed:** browsing can feel slow on iOS specifically, because
 Apple's Files app quietly checks for a hidden companion file for every
@@ -143,6 +144,7 @@ See `.env.example` for the full list with comments. The essentials:
 | `PORT`, `BIND_ADDRESS` | Where the server listens (default `8080`, `0.0.0.0`) |
 | `LOG_LEVEL` | `trace\|debug\|info\|warn\|error` |
 | `CACHE_TTL_SECONDS` | How long RomM listing results are cached in memory (default `30`, `0` disables) — keeps browsing fast without hammering RomM |
+| `HISTORY_KEEP_COUNT` | Max history rows kept per save/state slot before old ones are auto-deleted (default `20`, `0` disables pruning) |
 
 ## Running
 
@@ -171,10 +173,12 @@ internally.
   syncs, whichever upload happened most recently is what every device
   sees next. The other save isn't deleted, just not surfaced as a
   conflict — RomM keeps every upload as history.
-- **History isn't pruned automatically.** Every save/state upload adds a
-  new row in RomM rather than replacing the old one. Over months of play
-  this adds up — use RomM's own cleanup tools (or manual deletion) to
-  prune old saves, this shim won't do it for you.
+- **History is capped at `HISTORY_KEEP_COUNT` per slot (default 20), not
+  unlimited.** Every save/state upload adds a new row in RomM rather than
+  replacing the old one; once a slot passes the cap, the oldest rows
+  beyond it are deleted automatically right after the upload that pushed
+  it over. Set `HISTORY_KEEP_COUNT=0` if you'd rather keep everything
+  forever and prune manually via RomM's own tools instead.
 - **Games are matched by filename.** Two different games that happen to
   produce a save with the same filename would collide. Not an issue for a
   normal personal library where filenames are already unique.
@@ -218,11 +222,12 @@ sync never touches it.
   `.state` + `auto`, which then fails to match anything). Handled as a
   special case.
 - **Every upload becomes a new row in RomM, never overwriting the last
-  one.** This means older saves are never lost, and it's also *why* a
-  library's pre-existing saves/states (from RomM's browser player, manual
-  uploads, whatever) automatically show up in RetroArch the first time you
-  sync — reads just look for whatever's newest, regardless of who created
-  it.
+  one** (up to `HISTORY_KEEP_COUNT`, see Configuration — older rows beyond
+  that are pruned automatically). This means recent saves are never lost
+  to an overwrite, and it's also *why* a library's pre-existing
+  saves/states (from RomM's browser player, manual uploads, whatever)
+  automatically show up in RetroArch the first time you sync — reads just
+  look for whatever's newest, regardless of who created it.
 - **RomM silently overwrites an upload with the same filename**, which
   would otherwise break the "keep every upload as history" behavior above
   — RetroArch always uploads the same filename for a given save slot. The
