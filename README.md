@@ -341,6 +341,34 @@ tree depth is dynamic rather than fixed like `/roms/`'s two levels
 is one or two levels; `src/webdavServer.ts`'s `saveStateListing` walks the
 flat path list to reconstruct whatever depth is actually there.
 
+- **Browsing felt slow before RomM listing calls were cached — verified
+  live.** Request logs from a real Files app browse showed `/api/platforms`,
+  `/api/roms`, `/api/saves`, `/api/states` being re-fetched from RomM on
+  nearly every single PROPFIND, including literally millisecond-identical
+  concurrent duplicates — because a WebDAV browse isn't just the folders
+  you actually open: Files/Finder fire an invisible `PROPFIND` for a
+  `._<name>` AppleDouble companion file per entry too (harmless — always
+  404s, never touches RomM or creates anything — but it's still a request).
+  `src/rommClient.ts` now caches these listing calls in memory for
+  `CACHE_TTL_SECONDS` (default 30s) with in-flight deduplication, and
+  invalidates immediately on this shim's own writes. After that fix, the
+  same browse showed each listing endpoint hit once, not dozens of times.
+- **What's left after caching is client-side, not server-side.** iOS
+  Files' WebDAV client sends its `._name` probes and real listing requests
+  one at a time, sequentially, waiting for each response — for a library
+  of hundreds of roms this adds up to real wall-clock time purely from
+  network round-trips, even though every individual response is now a fast
+  in-memory cache hit. Not fixable from the server; a non-Apple WebDAV
+  client (Cyberduck, Transmit, ForkLift, ...) skips the AppleDouble probing
+  entirely and browses noticeably faster.
+- **RetroArch's own in-app file browser can't reach this at all** —
+  confirmed live: it's a simple local-filesystem browser with no
+  OS-document-picker or network-location integration, so there's no way to
+  point RetroArch's own "Load Content" at `/roms/` directly, on iOS or
+  otherwise. Downloading still has to go through a separate WebDAV client
+  or RomM's own web UI, then a manual move into RetroArch's content
+  directory — see "Downloading roms" above.
+
 ## Configuration (env vars)
 
 See `.env.example`. All required, no hardcoded secrets in code:
@@ -358,6 +386,10 @@ See `.env.example`. All required, no hardcoded secrets in code:
   `0.0.0.0`).
 - `LOG_LEVEL` — `trace|debug|info|warn|error`. `debug` logs every WebDAV
   request (verb + path) and the RomM API call it triggered.
+- `CACHE_TTL_SECONDS` — how long RomM listing calls (platforms, roms,
+  saves, states, rom-by-id) are cached in memory (default `30`, `0`
+  disables caching). See "Browsing saves and states" below for why this
+  matters in practice.
 
 ## Running
 
