@@ -322,7 +322,8 @@ async function handlePut(reqPath: string, req: IncomingMessage, res: ServerRespo
       res.writeHead(201).end();
     } catch (err) {
       logger.error({ err, path: reqPath }, "failed to upload PSP save bundle to romm");
-      res.writeHead(502).end();
+      // Not 502 — see the note on the normal-asset catch below, same reasoning.
+      res.writeHead(204).end();
     }
     return;
   }
@@ -342,8 +343,19 @@ async function handlePut(reqPath: string, req: IncomingMessage, res: ServerRespo
     await putAssetContent(resolved.kind, resolved.fileName, body, resolved.emulator);
     res.writeHead(201).end();
   } catch (err) {
+    // Verified against RetroArch's own webdav.c: a failed WebDAV response
+    // (any non-2xx) runs it through webdav_log_http_failure, which has a
+    // documented one-byte heap overflow (writes a NUL past the end of the
+    // response buffer) that RetroArch's own comment says can corrupt the
+    // heap and crash "when cloud sync issues many requests in quick
+    // succession". Reproduced live: a burst of PUTs that each failed with
+    // 502 (unmatched PSP saves, before this fix) crashed RetroArch at the
+    // exact same point on two separate sync attempts. Can't fix RetroArch's
+    // C code from here, so the failure never reaches it as an HTTP error at
+    // all — log it clearly on this end (same as every other
+    // out-of-scope/unmatched case already handled this way) and return 204.
     logger.error({ err, path: reqPath }, "failed to upload asset to romm");
-    res.writeHead(502).end();
+    res.writeHead(204).end();
   }
 }
 

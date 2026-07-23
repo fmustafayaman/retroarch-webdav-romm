@@ -128,6 +128,20 @@ RetroArch's Cloud Sync, which never touches `/roms/` at all.
     match. The shim strips `(...)`/`[...]` tag groups before searching
     (`stripTags` in `src/rommClient.ts`) and only relies on the exact
     tagged filename for the final match against `fs_name_no_ext`/`fs_name`.
+- `PUT` failures (rom not found, RomM unreachable, ...) are logged as
+  errors on this end but **always answered with `204`, never an error
+  status**. This isn't leniency for its own sake — it's a crash
+  workaround. RetroArch's own `webdav.c` has a documented bug (its own
+  source comment, on `webdav_log_http_failure`): any non-2xx WebDAV
+  response gets logged through a path with a one-byte heap overflow (a
+  buffer gets NUL-terminated one byte past its allocated length), which
+  can corrupt the heap and crash RetroArch — the comment specifically
+  calls out "when cloud sync issues many requests in quick succession".
+  Reproduced live: a burst of PUTs that each genuinely failed with `502`
+  (PSP saves with no `PSP_SERIAL_MAP` entry yet — see below) crashed
+  RetroArch at the identical point on two separate sync attempts. Can't
+  fix RetroArch's C code from here, so the failure is kept from ever
+  reaching it as an HTTP error at all.
 - `DELETE` — best-effort. Failures are logged and still answered with `204`,
   since RetroArch treats cloud sync deletes as fire-and-forget.
 - `MOVE` — RetroArch only issues this to back a file up under `deleted/...`
