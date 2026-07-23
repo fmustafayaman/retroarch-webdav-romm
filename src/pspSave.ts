@@ -190,6 +190,39 @@ async function loadBundleEntries(asset: RommAsset): Promise<ZipEntry[]> {
 }
 
 /**
+ * Files PUT for a save folder that has no bundle yet and couldn't (yet)
+ * be resolved to a rom — held here until something resolves it (usually
+ * PARAM.SFO arriving), instead of being dropped. Verified live this
+ * matters: RetroArch fires off a save folder's several file PUTs close
+ * enough together that a plain non-SFO file routinely gets processed
+ * *before* PARAM.SFO — without buffering, that file (once, the actual
+ * save-data file itself) was silently lost, leaving a bundle with only
+ * PARAM.SFO + an icon in it, no actual save data.
+ */
+const pendingFiles = new Map<string, Map<string, Buffer>>();
+
+/**
+ * Per-save-folder serialization. Node runs this module single-threaded,
+ * but `putPspFile` awaits network I/O (RomM search/download/upload) in
+ * the middle of a read-modify-write over `pendingFiles` and RomM's save
+ * list — without this, two of a folder's files landing close together
+ * could both see "no bundle yet, not resolved yet", both buffer
+ * themselves, and each finish not knowing about the other's write,
+ * corrupting which files end up in the final upload. Locking by folder
+ * (not globally) keeps unrelated saves/states fully concurrent.
+ */
+const folderLocks = new Map<string, Promise<unknown>>();
+function withFolderLock<T>(folder: string, fn: () => Promise<T>): Promise<T> {
+  const prior = folderLocks.get(folder) ?? Promise.resolve();
+  const run = prior.then(fn, fn);
+  folderLocks.set(
+    folder,
+    run.catch(() => {}),
+  );
+  return run;
+}
+
+/**
  * Merges one uploaded file into its save folder's bundle and re-uploads
  * it. Deliberately does NOT preserve per-file history the way normal
  * saves/states do (assetSync.ts's putAssetContent): PPSSPP writes a save
@@ -201,51 +234,67 @@ async function loadBundleEntries(asset: RommAsset): Promise<ZipEntry[]> {
  * up, so RomM holds exactly one row per (rom, save folder) at a time.
  */
 export async function putPspFile(info: PspFilePath, content: Buffer): Promise<void> {
-  const existing = await findBundleByFolder(info.saveFolder);
+  return withFolderLock(info.saveFolder, async () => {
+    const existing = await findBundleByFolder(info.saveFolder);
 
-  let romId: number;
-  let priorEntries: ZipEntry[] = [];
+    let romId: number;
+    let priorEntries: ZipEntry[] = [];
 
-  if (existing) {
-    romId = existing.rom_id;
-    priorEntries = await loadBundleEntries(existing);
-  } else {
-    let sfoTitle: string | null = null;
-    if (info.fileName.toUpperCase() === "PARAM.SFO") {
-      try {
-        const parsed = parseSfo(content);
-        if (typeof parsed.TITLE === "string") sfoTitle = parsed.TITLE;
-      } catch (err) {
-        logger.warn({ err }, "failed to parse PARAM.SFO");
+    if (existing) {
+      romId = existing.rom_id;
+      priorEntries = await loadBundleEntries(existing);
+    } else {
+      let sfoTitle: string | null = null;
+      if (info.fileName.toUpperCase() === "PARAM.SFO") {
+        try {
+          const parsed = parseSfo(content);
+          if (typeof parsed.TITLE === "string") sfoTitle = parsed.TITLE;
+        } catch (err) {
+          logger.warn({ err }, "failed to parse PARAM.SFO");
+        }
       }
+      const resolved = await resolveRomId(info.saveFolder, sfoTitle);
+      if (resolved === null) {
+        const pending = pendingFiles.get(info.saveFolder) ?? new Map<string, Buffer>();
+        pending.set(info.fileName, content);
+        pendingFiles.set(info.saveFolder, pending);
+        const serial = deriveSerial(info.saveFolder);
+        logger.debug(
+          { saveFolder: info.saveFolder, fileName: info.fileName, pendingCount: pending.size },
+          "PSP save folder not resolved yet, buffering file",
+        );
+        throw new Error(
+          `No RomM rom found yet for PSP save folder "${info.saveFolder}" (serial "${serial}") — ` +
+            `buffered "${info.fileName}", will merge it in once resolved (e.g. PARAM.SFO arrives). ` +
+            `If this never resolves, add it to PSP_SERIAL_MAP.`,
+        );
+      }
+      romId = resolved;
     }
-    const resolved = await resolveRomId(info.saveFolder, sfoTitle);
-    if (resolved === null) {
-      const serial = deriveSerial(info.saveFolder);
-      throw new Error(
-        `No RomM rom found for PSP save folder "${info.saveFolder}" (serial "${serial}"). ` +
-          `Add it to PSP_SERIAL_MAP, e.g. {"${serial}": "<rom title as it appears in RomM>"}.`,
+
+    // Now resolved (either an existing bundle, or fresh via this call) —
+    // fold in anything buffered earlier while this folder was unresolved.
+    const pending = pendingFiles.get(info.saveFolder);
+    pendingFiles.delete(info.saveFolder);
+
+    const merged = new Map(priorEntries.map((e) => [e.name, e.data]));
+    if (pending) for (const [name, data] of pending) merged.set(name, data);
+    merged.set(info.fileName, content);
+    const zip = createZip([...merged.entries()].map(([name, data]) => ({ name, data })));
+
+    const rommEmulator = toRommEmulator(info.emulator);
+    logger.debug(
+      { saveFolder: info.saveFolder, fileName: info.fileName, romId, files: merged.size },
+      "updating PSP save bundle",
+    );
+    await uploadNewSave(romId, bundleBaseName(info.saveFolder), zip, rommEmulator);
+
+    if (existing) {
+      await deleteSaves([existing.id]).catch((err) =>
+        logger.warn({ err, id: existing.id }, "failed to clean up previous PSP bundle row"),
       );
     }
-    romId = resolved;
-  }
-
-  const merged = new Map(priorEntries.map((e) => [e.name, e.data]));
-  merged.set(info.fileName, content);
-  const zip = createZip([...merged.entries()].map(([name, data]) => ({ name, data })));
-
-  const rommEmulator = toRommEmulator(info.emulator);
-  logger.debug(
-    { saveFolder: info.saveFolder, fileName: info.fileName, romId, files: merged.size },
-    "updating PSP save bundle",
-  );
-  await uploadNewSave(romId, bundleBaseName(info.saveFolder), zip, rommEmulator);
-
-  if (existing) {
-    await deleteSaves([existing.id]).catch((err) =>
-      logger.warn({ err, id: existing.id }, "failed to clean up previous PSP bundle row"),
-    );
-  }
+  });
 }
 
 export async function getPspFile(info: PspFilePath): Promise<Buffer | null> {

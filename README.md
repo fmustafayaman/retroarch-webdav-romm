@@ -187,6 +187,18 @@ separately from every other save/state:
   be noise, so the previous bundle row is deleted once the newly-merged one
   is up. Only the final, fully-merged state after a save event is a
   meaningful checkpoint.
+- **Files that arrive before the folder can be resolved to a rom are
+  buffered, not dropped.** Verified live that RetroArch doesn't guarantee
+  `PARAM.SFO` arrives first — a plain data file routinely gets processed
+  *before* it, and since a brand-new save folder can only be resolved to a
+  rom via `PARAM.SFO`'s title (or `PSP_SERIAL_MAP`), that file would
+  otherwise be silently lost, leaving a bundle with metadata/icon files
+  but no actual save data. Unresolved files are held in memory per save
+  folder (`pendingFiles` in `src/pspSave.ts`) and folded in once something
+  resolves the folder — usually `PARAM.SFO` itself arriving moments later
+  in the same sync. All PUTs for the same save folder are also serialized
+  (`withFolderLock`) so two files landing close together can't both miss
+  seeing each other's buffered state.
 - **Matching a save folder to a RomM rom is automatic** — no per-game setup
   needed for the normal case. RomM has no PSP serial/product-code field to
   look this up directly (checked its API and rom schema — nothing there),
